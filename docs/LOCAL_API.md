@@ -98,3 +98,8 @@ removal. Rolling back application code leaves this metadata in place, but older
 code does not enforce it; never treat a source rollback as a verified data
 migration. External backup deletion and multi-process admission remain separate
 operational concerns.
+
+
+## Workflow MCP and API
+
+The `tmcra_workflows` MCP tool maps project-bound calls to the existing workflow API. See [the concrete four-feature MCP/HTTP examples](WORKFLOW_MCP_API.zh-CN.md) and [client invocation table](WORKFLOW_COMMANDS.zh-CN.md). Public completion receipts remain reported; sensitive exports, commits, recovery and deletion require explicit user confirmation.

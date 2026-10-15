@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>TMCRA · 项目接续工作台</title>
+  <link rel="stylesheet" href="./workflow-center.css">
+  <script type="module" src="./workflow-center.js"></script>
+</head>
+<body>
+<a class="skip" href="#workspace">跳到工作台</a>
+<header class="masthead"><div><p class="eyebrow">TMCRA / WORKFLOW CENTER</p><h1>让项目准确接着往下走</h1><p>执行证据、决策变更、情景提醒和选择性记忆迁移。</p></div><a id="personal-back" href="/personal" target="_top" hidden>返回个人空间</a></header>
+<main id="workspace">
+  <section class="connection card" aria-labelledby="connection-title"><h2 id="connection-title">连接项目</h2>
+    <form id="connection-form"><div id="local-connection" class="fields">
+      <label>项目 ID<input id="project" name="project" required value="default" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"></label>
+      <label>本地访问 Token<input id="token" name="token" type="password" required autocomplete="off" spellcheck="false"></label>
+    </div><label id="personal-project-label" hidden>当前项目<select id="personal-project"><option value="global">全局记忆</option></select></label><p id="connection-note">Token 只留在当前页面内存中，刷新页面即清除；不会写入 URL 或浏览器存储。</p><button id="connect" type="submit">连接并刷新</button></form>
+    <p id="status" role="status" aria-live="polite">尚未连接。</p><button id="disconnect" type="button" class="quiet" hidden>断开并清除 Token</button>
+  </section>
+  <nav class="tabs" aria-label="工作台分区"><a href="#tasks">项目接续</a><a href="#decisions">决策时间机</a><a href="#reminders">情景提醒</a><a href="#bridge">记忆桥</a></nav>
+  <p class="boundary">“已报告通过”不等于实际执行验证。导入内容始终是外部未验证信息，不会执行其中的命令、链接或文件路径。</p>
+  <div class="grid">
+    <section id="tasks" class="card" aria-labelledby="tasks-title"><p class="eyebrow">01 / CONTINUE WITH EVIDENCE</p><h2 id="tasks-title">项目接续与防重复踩坑</h2><div id="task-list" class="records empty">连接后读取任务。</div>
+      <details><summary>新增或更新任务</summary><form id="task-form" class="fields">
+        <label>任务 ID<input name="id" required maxlength="128" placeholder="release-v1"></label><label>标题<input name="title" required maxlength="300"></label>
+        <label class="wide">目标<textarea name="goal" maxlength="4000"></textarea></label><label class="wide">下一步<textarea name="next_step" maxlength="4000"></textarea></label>
+        <label>状态<select name="status"><option value="todo">待办</option><option value="in_progress">进行中</option><option value="blocked">受阻</option><option value="done">已完成（待证据核验）</option></select></label><label>代码 / 配置版本<input name="version" required maxlength="200" placeholder="commit 或配置版本"></label>
+        <label>证据 ID（逗号分隔）<input name="evidence_ids"></label><label>证据过期时长（秒）<input name="stale_after_seconds" type="number" value="86400" min="60" max="2592000" required></label><button class="wide" type="submit">保存任务</button>
+      </form></details>
+      <details><summary>记录一次结果（人工报告）</summary><form id="receipt-form" class="fields"><label>任务 ID<input name="id" required></label><label>版本<input name="version" required></label><label>报告结果<select name="outcome"><option value="unknown">未知</option><option value="passed">通过（报告）</option><option value="failed">失败（报告）</option></select></label><label>证据 ID<input name="evidence_ids"></label><label class="wide">结果摘要<textarea name="summary" required></textarea></label><p class="wide note">此入口不会把文本报告升级成机器执行验证。</p><button type="submit" class="wide">保存人工报告</button></form></details>
+      <details><summary>记录实验与重试条件</summary><form id="attempt-form" class="fields"><label>尝试 ID<input name="id" required></label><label>任务 ID<input name="task_id" required></label><label>结果<select name="outcome"><option value="failed">失败</option><option value="passed">通过</option><option value="unknown">未知</option></select></label><label>证据 ID<input name="evidence_ids"></label><label class="wide">实际配置（JSON 对象）<textarea name="config" required>{"version":"v1"}</textarea></label><label class="wide">结果摘要<textarea name="summary" required></textarea></label><label class="wide">条件发生什么变化才值得重试（每行一项）<textarea name="retry_conditions" required></textarea></label><button class="wide" type="submit">记录尝试</button></form></details><div id="attempt-list" class="records"></div>
+    </section>
+    <section id="decisions" class="card" aria-labelledby="decisions-title"><p class="eyebrow">02 / DECISION HISTORY</p><h2 id="decisions-title">决策时间机</h2><div id="decision-list" class="records empty">连接后读取决策。</div>
+      <details><summary>新增决策</summary><form id="decision-form" class="fields"><label>决策 ID<input name="id" required></label><label>标题<input name="title" required></label><label class="wide">当前结论<textarea name="text" required></textarea></label><label>证据 ID<input name="evidence_ids"></label><label>依赖决策 ID（逗号分隔）<input name="depends_on"></label><button class="wide" type="submit">保存决策</button></form></details>
+      <details><summary>用新证据修订决策</summary><form id="revision-form" class="fields"><label>决策 ID<input name="id" required></label><label>新证据 ID<input name="evidence_ids"></label><label class="wide">新结论<textarea name="text" required></textarea></label><label class="wide">为什么需要更新<textarea name="reason" required></textarea></label><button class="wide" type="submit">保存变更并标记受影响决策</button></form></details>
+    </section>
+    <section id="reminders" class="card" aria-labelledby="reminders-title"><p class="eyebrow">03 / CONTEXTUAL REMINDERS</p><h2 id="reminders-title">情景提醒</h2><p>只在你打开项目、提问或切换任务时评估，不做后台通知。</p><form id="evaluate-form" class="fields"><label>当前情景<select name="event"><option value="project_open">打开项目</option><option value="question">正在提问</option><option value="task_switch">切换任务</option></select></label><label>任务 ID（可选）<input name="task_id"></label><label class="wide">问题 / 当前上下文<textarea name="question"></textarea></label><label class="wide">准备重试的实际配置（可选 JSON；与失败记录比较）<textarea name="config" placeholder='{"version":"v1"}'></textarea></label><button type="submit" class="wide">检查此时值得提醒的事</button></form><div id="reminder-result" class="records" aria-live="polite"></div><div id="reminder-list" class="records"></div>
+      <details><summary>新增情景提醒</summary><form id="reminder-form" class="fields"><label>提醒 ID<input name="id" required></label><label>标题<input name="title" required></label><label class="wide">为什么值得提醒<textarea name="reason" required></textarea></label><label>证据 ID<input name="evidence_ids"></label><label>关联任务 ID（可选）<input name="task_id"></label><label>触发词（逗号分隔）<input name="query_terms"></label><label>冷却秒数<input name="cooldown_seconds" type="number" value="86400" min="1" max="2592000" required></label><fieldset class="wide"><legend>触发情景（至少一个）</legend><label class="inline"><input name="events" type="checkbox" value="project_open" checked>打开项目</label><label class="inline"><input name="events" type="checkbox" value="question" checked>提问</label><label class="inline"><input name="events" type="checkbox" value="task_switch">切换任务</label></fieldset><button class="wide" type="submit">保存提醒</button></form></details>
+    </section>
+    <section id="bridge" class="card" aria-labelledby="bridge-title"><p class="eyebrow">04 / SELECTIVE MEMORY BRIDGE</p><h2 id="bridge-title">选择性跨端记忆桥</h2><p>手动选择与预览；无后台上传，不默认共享全部聊天。</p>
+      <h3>导出</h3><form id="export-form" class="fields"><label class="wide">内容范围<select name="mode" id="export-mode"><option value="knowledge_only">仅选定知识 / 决策</option><option value="selected_sources">选定原始记录（会含原文）</option></select></label><div id="source-list" class="wide sources empty">连接后显示可选记录，默认不勾选。</div><label class="wide">其他已知记录 ID（可选，逗号分隔）<input name="selected_ids" placeholder="只填写你确实要迁移的记录"></label><button class="wide" type="submit">预览选定内容</button></form><pre id="export-preview" hidden></pre><button type="button" id="export-download" hidden>确认内容并下载 JSON</button>
+      <details><summary>导出撤销包（同步删除）</summary><p class="note">只导出明确选定的来源撤销标记。接收端仍需预览与确认，才会删除先前导入的对应副本；不自动连接其他设备。</p><form id="revocation-form"><div id="revocation-list" class="sources empty">暂无已记录撤销。</div><button type="submit">预览选定撤销包</button></form></details><h3>导入</h3><label>选择记忆包 JSON（最多 400 KB）<input id="import-file" type="file" accept=".json,application/json"></label><p id="import-file-status" role="status"></p><div id="import-items" class="sources"></div><button id="import-preview-button" type="button" disabled>预览选定导入项</button><p id="import-warning" class="boundary" hidden></p><pre id="import-preview" hidden></pre><label class="inline" id="import-confirm-label" hidden><input id="import-confirm" type="checkbox">我已核对内容、冲突及目标项目；这些是外部未验证信息。</label><button id="import-commit" type="button" disabled hidden>确认导入</button><pre id="import-result" hidden></pre><div id="bridge-plans" class="records"></div>
+    </section>
+  </div>
+</main>
+<footer>验证状态来自服务端证据；页面不执行导入的文本、命令或 URL。</footer>
+</body></html>

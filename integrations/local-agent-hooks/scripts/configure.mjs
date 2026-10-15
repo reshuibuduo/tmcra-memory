@@ -11,6 +11,7 @@ if (!runtimeConfig) throw new Error("--runtime-config is required");
 
 const result = await writeIntegrationConfig({
   runtimeConfigPath: resolve(runtimeConfig),
+  workflowPython: option("--python"),
   outputPath: option("--output") || process.env.TMCRA_LOCAL_INTEGRATION_CONFIG || undefined,
   baseUrl: option("--base-url", "http://127.0.0.1:2009"),
   stateDir: option("--state-dir") || process.env.TMCRA_LOCAL_INTEGRATION_STATE_DIR || undefined,

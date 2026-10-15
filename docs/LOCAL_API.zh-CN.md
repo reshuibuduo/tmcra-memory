@@ -87,3 +87,8 @@ GET  /v1/usage?project_id=project-stable-id&limit=50
 删除消息或项目时，在同一个 SQLite 事务中保留稳定身份的哈希和撤销时间，不保留正文或原始 native ID。检查本地 message ID 与既有 `(source_app, native_thread_id, native_message_id)` 唯一键；延迟到达的 hook 上传即使只更换本地 ID、项目或 API session，也会被拒绝，不会重新创建已删除的来源。
 
 这是身份撤销，不是正文黑名单；全新身份不因正文相同而被拒绝。重启时补记仍保留的软删除身份；升级前已物理删除且无记录的身份不会恢复。撤销记录不随项目删除而消失。源码回退不删除该表，但旧代码不执行新增保护，实际降级应评估差异。外部备份删除和多进程写入仍需独立验收。
+
+
+## Workflow MCP and API
+
+The `tmcra_workflows` MCP tool maps project-bound calls to the existing workflow API. See [the concrete four-feature MCP/HTTP examples](WORKFLOW_MCP_API.zh-CN.md) and [client invocation table](WORKFLOW_COMMANDS.zh-CN.md). Public completion receipts remain reported; sensitive exports, commits, recovery and deletion require explicit user confirmation.

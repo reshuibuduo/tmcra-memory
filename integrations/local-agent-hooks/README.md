@@ -31,3 +31,8 @@ Restart Codex and review the four hooks under `/hooks`. Codex requires the user 
 - The local bearer token is read from its file at request time and is never serialized into integration state.
 - Common credentials are redacted before recall queries or message writes.
 - Hook errors are fail-open for the host agent. Diagnostics contain error class and bounded messages, not prompts or responses.
+
+
+## Workflow Skill and MCP
+
+`skills/tmcra-workflows` provides resume, timeline, reminder and selective-package workflows through the actual `tmcra_workflows` MCP tool. See [MCP/API examples](docs/workflow-mcp-api.zh-CN.md). Skill files alone do not prove the client loaded the server; confirm with tools/list and a real read. Sensitive actions still require host confirmation.

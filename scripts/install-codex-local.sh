@@ -8,7 +8,9 @@ NODE=${NODE:-node}
 CODEX=${CODEX:-codex}
 
 "$NODE" --version
-"$NODE" "$PLUGIN/scripts/configure.mjs" --runtime-config "$RUNTIME_CONFIG"
+WORKFLOW_PYTHON=${TMCRA_LOCAL_PYTHON:-"$REPO/.tmcra/venv/bin/python"}
+test -x "$WORKFLOW_PYTHON" || { printf '%s\n' 'Run install-local.sh first, or set TMCRA_LOCAL_PYTHON to the installed runtime Python.' >&2; exit 2; }
+"$NODE" "$PLUGIN/scripts/configure.mjs" --runtime-config "$RUNTIME_CONFIG" --python "$WORKFLOW_PYTHON"
 
 if [ "${TMCRA_SKIP_CODEX_PLUGIN_INSTALL:-0}" != "1" ]; then
   "$CODEX" plugin marketplace --help >/dev/null

@@ -231,3 +231,8 @@ code/                     较早的公开运行时与适配器快照
 ## 许可
 
 TMCRA 采用 [Apache License 2.0](LICENSE)。第三方数据集、模型和组件保留各自许可，详见对应声明与模型卡。
+
+
+### Skill、MCP 与 API
+
+四功能统一使用 `tmcra_workflows` MCP：任务接续、决策历史、情景提醒和选择性记忆包。参见 [一页调用表](docs/WORKFLOW_COMMANDS.zh-CN.md) 与 [真实 MCP / HTTP 示例](docs/WORKFLOW_MCP_API.zh-CN.md)。普通记录不等于执行验证；敏感操作仍需明确确认。
