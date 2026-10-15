@@ -132,6 +132,11 @@ class LocalMemoryEngine:
             log_dir=None,
         )
 
+    @property
+    def workflows(self):
+        from .local_workflows import local_workflows
+        return local_workflows(self)
+
     @contextmanager
     def _usage_for(self, project_id: str = "", session_id: str = ""):
         previous = getattr(self._usage_context, "value", ("", ""))
@@ -617,6 +622,7 @@ class LocalMemoryEngine:
                     }
                 )
             self.store.invalidate_knowledge(self.project_scope(message["project_id"]))
+            self.workflows.revoke_sources(message["project_id"], [message_id])
             erased = self.store.erase_message_metadata(message_id)
             self.writer_store.secure_compact()
             self.store.secure_compact()
@@ -663,6 +669,7 @@ class LocalMemoryEngine:
                     self.writer_store.delete_message(scope_id, message_id)
                     self.store.invalidate_knowledge(scope_id)
                     deleted_scopes += 1
+            self.workflows.purge_namespace(project_id)
             self.store.delete_project_metadata(project_id)
             self.writer_store.secure_compact()
             self.store.secure_compact()

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tmcra-workflows": {
+      "command": "node",
+      "args": [
+        "./scripts/workflow_mcp.mjs"
+      ],
+      "cwd": "."
+    }
+  }
+}

@@ -5,6 +5,7 @@ param(
     [string]$IntegrationStateDir = '',
     [string]$CodexPath = '',
     [string]$NodePath = 'node',
+    [string]$WorkflowPython = '',
     [switch]$SkipPluginInstall
 )
 
@@ -28,7 +29,10 @@ function Invoke-Native {
 }
 
 Invoke-Native $NodePath '--version'
-$configureArguments = @((Join-Path $Plugin 'scripts\configure.mjs'), '--runtime-config', $RuntimeConfig)
+if (-not $WorkflowPython) { $WorkflowPython = $env:TMCRA_LOCAL_PYTHON }
+if (-not $WorkflowPython) { $WorkflowPython = Join-Path $Repo '.tmcra\venv\Scripts\python.exe' }
+if (-not (Test-Path -LiteralPath $WorkflowPython -PathType Leaf)) { throw 'Run install-local.ps1 first, or pass -WorkflowPython with the installed runtime Python.' }
+$configureArguments = @((Join-Path $Plugin 'scripts\configure.mjs'), '--runtime-config', $RuntimeConfig, '--python', $WorkflowPython)
 if ($IntegrationConfig) { $configureArguments += @('--output', $IntegrationConfig) }
 if ($IntegrationStateDir) { $configureArguments += @('--state-dir', $IntegrationStateDir) }
 Invoke-Native $NodePath @configureArguments

@@ -31,3 +31,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-codex-local.ps1
 - 每次请求从文件读取本机 bearer token，接入状态不会序列化 token。
 - 查询和写入前会脱敏常见凭据。
 - Hook 失败时让宿主继续运行。诊断日志只记录错误类型和截断后的错误信息，不记录用户问题或回答。
+
+
+## Workflow Skill and MCP
+
+`skills/tmcra-workflows` provides resume, timeline, reminder and selective-package workflows through the actual `tmcra_workflows` MCP tool. See [MCP/API examples](docs/workflow-mcp-api.zh-CN.md). Skill files alone do not prove the client loaded the server; confirm with tools/list and a real read. Sensitive actions still require host confirmation.

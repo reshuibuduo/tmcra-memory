@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from pydantic import BaseModel, Field, ConfigDict
 
 from .auth import ensure_local_token
 from .core import ProductWriterError
@@ -16,6 +16,13 @@ from .engine import LocalEngineError, LocalMemoryEngine
 
 
 LOGGER = logging.getLogger("tmcra_local.api")
+
+
+class WorkflowIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(min_length=1, max_length=64)
+    operation_id: str = Field(min_length=1, max_length=200)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageIn(BaseModel):
@@ -81,6 +88,39 @@ def create_app(
             status_code=500,
             content={"error": "InternalServerError", "detail": "local runtime failure"},
         )
+
+    from .workflows import WorkflowError
+    from .memory_bridge import BridgeError
+
+    @app.exception_handler(WorkflowError)
+    async def workflow_error(_, exc):
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.code, "detail": str(exc)})
+
+    @app.exception_handler(BridgeError)
+    async def bridge_error(_, exc):
+        return JSONResponse(status_code=409, content={"error": "bridge_rejected", "detail": str(exc)})
+
+    @app.get("/workflows")
+    def workflow_redirect():
+        return RedirectResponse("/workflows/workflow-center.html")
+
+    @app.get("/workflows/{asset}")
+    def workflow_ui(asset: str):
+        if asset not in {"workflow-center.html", "workflow-center.js", "workflow-center.css"}:
+            raise HTTPException(status_code=404)
+        return FileResponse(Path(__file__).parent / "ui" / asset, headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"})
+
+    @app.get("/v1/projects/{project_id}/workflows", dependencies=[Depends(authorize)])
+    def workflow_snapshot(project_id: str, as_of: str | None = Query(default=None, max_length=80)):
+        with engine._lock:
+            return engine.workflows.snapshot(project_id, as_of=as_of)
+
+    @app.post("/v1/projects/{project_id}/workflows", dependencies=[Depends(authorize)])
+    def workflow_action(project_id: str, body: WorkflowIn):
+        with engine._lock:
+            return engine.workflows.execute(project_id, body.action, body.payload, body.operation_id)
 
     @app.get("/v1/health")
     def health() -> dict[str, Any]:

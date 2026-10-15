@@ -239,3 +239,12 @@ See [`AUTHORS.md`](AUTHORS.md) and [`CITATION.cff`](CITATION.cff).
 ## License
 
 TMCRA is released under the [Apache License 2.0](LICENSE). Third-party datasets, models, and components retain their own licenses; see the relevant notices and model cards.
+
+## 记忆工作台
+
+新增任务执行证据、决策时间机、情景提醒和选择性记忆包。使用入口、API、真实执行与未验证边界见 [记忆工作台说明](docs/WORKFLOW_CENTER.zh-CN.md)。
+
+
+### Skill、MCP 与 API
+
+四功能统一使用 `tmcra_workflows` MCP：任务接续、决策历史、情景提醒和选择性记忆包。参见 [一页调用表](docs/WORKFLOW_COMMANDS.zh-CN.md) 与 [真实 MCP / HTTP 示例](docs/WORKFLOW_MCP_API.zh-CN.md)。普通记录不等于执行验证；敏感操作仍需明确确认。

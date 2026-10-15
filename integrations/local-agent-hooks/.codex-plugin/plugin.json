@@ -23,5 +23,7 @@
       "Write"
     ],
     "brandColor": "#30373D"
-  }
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
 }

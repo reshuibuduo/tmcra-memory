@@ -54,7 +54,13 @@
     "docs/LOCAL_INTEGRATIONS.zh-CN.md",
     "docs/PUBLIC_RELEASE_BOUNDARY.md",
     "docs/PUBLIC_RELEASE_BOUNDARY.zh-CN.md",
-    "models/tmcra_v4_longmemeval_s500_20260715/TMCRA_MODEL_MANIFEST.json"
+    "models/tmcra_v4_longmemeval_s500_20260715/TMCRA_MODEL_MANIFEST.json",
+    "integrations/local-agent-hooks/.mcp.json",
+    "integrations/local-agent-hooks/scripts/workflow_mcp.mjs",
+    "integrations/local-agent-hooks/skills/tmcra-workflows/SKILL.md",
+    "integrations/local-agent-hooks/skills/tmcra-workflows/references/api.md",
+    "docs/WORKFLOW_COMMANDS.zh-CN.md",
+    "docs/WORKFLOW_MCP_API.zh-CN.md"
   ],
   "excluded_capabilities": [
     "hosted-account-control-plane",

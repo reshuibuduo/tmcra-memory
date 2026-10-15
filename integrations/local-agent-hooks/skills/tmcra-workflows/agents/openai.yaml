@@ -1,0 +1,4 @@
+interface:
+  display_name: "TMCRA Workflows"
+  short_description: "Resume tasks, trace decisions, and transfer selected memory"
+  default_prompt: "Use $tmcra-workflows to inspect this project and continue from its recorded evidence."

@@ -25,6 +25,8 @@ test = ["httpx==0.28.1", "pytest==9.0.3"]
 
 [project.scripts]
 tmcra-local = "tmcra_local.__main__:main"
+tmcra-workflow = "tmcra_local.workflow_client:main"
+tmcra-workflow-mcp = "tmcra_local.workflow_mcp:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -32,3 +34,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.setuptools.package-data]
+tmcra_local = ["ui/*.html", "ui/*.js", "ui/*.css", "ui/*.json"]

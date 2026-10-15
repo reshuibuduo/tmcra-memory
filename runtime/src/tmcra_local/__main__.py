@@ -621,11 +621,21 @@ def parser() -> argparse.ArgumentParser:
     doctor.add_argument("--generation-startup-timeout", type=float, default=300.0)
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=_doctor)
+    workflow = sub.add_parser("workflow", help="use the existing local workflow API (no model initialization)", add_help=False)
+    workflow.add_argument("workflow_args", nargs=argparse.REMAINDER)
+    def workflow_handler(args):
+        from .workflow_client import main as workflow_main
+        return workflow_main(args.workflow_args)
+    workflow.set_defaults(handler=workflow_handler)
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     _utf8_stdio()
+    selected = list(sys.argv[1:] if argv is None else argv)
+    if selected and selected[0] == "workflow":
+        from .workflow_client import main as workflow_main
+        return workflow_main(selected[1:])
     try:
         args = parser().parse_args(argv)
         return int(args.handler(args))

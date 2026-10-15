@@ -1,0 +1,8 @@
+{
+  "schema": "tmcra.workflow-ui-assets.v1",
+  "files": {
+    "workflow-center.css": "400f005189a72bf426357b91ac1b882a5b8e58e7d43d2f699baf98bd365e9c54",
+    "workflow-center.html": "3d1066b898f4155f985211d4c94e7d6211208c024e8c16ac5b4a3217b24ae870",
+    "workflow-center.js": "a83fbc88ff569ed9df522583a614c869996b4ff81deb3bf40eccec7dac136d12"
+  }
+}

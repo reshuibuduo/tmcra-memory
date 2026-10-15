@@ -50,4 +50,5 @@ export function writeIntegrationConfig(options: {
   stateDir?: string;
   topK?: number;
   userVisibility?: "project" | "global" | "both";
+  workflowPython?: string;
 }): Promise<{ configPath: string; tokenFileStoredByReference: true; secretPrinted: false }>;
