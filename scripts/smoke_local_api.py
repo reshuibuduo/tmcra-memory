@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from tmcra_local.http_transport import open_request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +88,7 @@ class Client:
             f"{self.base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_request(request, timeout=self.timeout) as response:
                 status = int(response.getcode())
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:

@@ -9,6 +9,8 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from .http_transport import open_request
+
 from .core.v4_batch_writer import (
     BATCH_SYSTEM_PROMPT,
     ProductWriterError,
@@ -168,7 +170,7 @@ class OpenAICompatibleClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_request(request, timeout=self.timeout) as response:
                 status = int(response.getcode())
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:

@@ -8,6 +8,10 @@
 
 TMCRA 为长期运行的 Agent 提供跨会话、跨软件且可追溯来源的持久记忆。当前用户提出问题后，系统从用户全局作用域和当前项目作用域召回证据，随后保存 USER 来源记录；Agent 完成回答后，再保存独立的 ASSISTANT 来源记录。
 
+**仓库分工：** 这里是个人本地 Agent 记忆版；完整服务端、Web 和设备应用位于
+[tmcra](https://github.com/reshuibuduo/tmcra)。两者的配置和存储契约独立，
+互相链接不代表已经实现账号互通或跨设备同步。
+
 本仓库包含可独立运行的本地版。用户克隆仓库后，可填写自己的 OpenAI 兼容 API Key，也可以选择本地生成模型；完整记忆服务只监听 `127.0.0.1`，不要求注册 TMCRA 账号，也不依赖 TMCRA 生产服务器。
 
 ## 功能详解
@@ -110,8 +114,8 @@ Session 是项目内部的来源分组，不是第三个独立召回作用域。
 ### Windows PowerShell
 
 ```powershell
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
+git clone https://github.com/reshuibuduo/tmcra-memory.git
+cd tmcra-memory
 git lfs install
 powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
@@ -122,8 +126,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
 ### Linux 或 macOS
 
 ```bash
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
+git clone https://github.com/reshuibuduo/tmcra-memory.git
+cd tmcra-memory
 git lfs install
 bash scripts/install-local.sh
 bash scripts/start-local.sh

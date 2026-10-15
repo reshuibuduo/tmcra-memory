@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Route loopback Python generation requests, probes and the local API smoke
+  client directly instead of inheriting environment or OS proxies; reject
+  redirects from these endpoints. Explicit remote BYOK networking is unchanged.
+- Reject HTTP redirects in shared local Agent hooks so memory payloads are not
+  forwarded to a different listener. Failed writes retain the existing outbox
+  behavior; this does not add a cloud fallback.
+- Add real HTTP regression tests and make the local cross-tool API test
+  independent of system proxy settings. Clarify the two repository roles and
+  update clone commands to the current `tmcra-memory` repository name.
+
 ## 2026.08.16
 
 - Added an owner-local TMCRA runtime with a loopback-only FastAPI service,

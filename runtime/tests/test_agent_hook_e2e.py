@@ -9,12 +9,13 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 import uvicorn
 
 from conftest import FakeMemoryModel
 from tmcra_local.api import create_app
+from tmcra_local.http_transport import open_request
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +34,7 @@ def _request(base_url: str, token: str, path: str, method: str = "GET") -> dict:
         method=method,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    with urlopen(request, timeout=10) as response:
+    with open_request(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

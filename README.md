@@ -8,6 +8,12 @@
 
 TMCRA gives long-running agents persistent, source-traceable memory across sessions and applications. A user prompt triggers recall from the owner-global and current-project scopes, followed by a USER source record; after the answer, a separate ASSISTANT source record is stored.
 
+**Repository scope:** this is the owner-local Agent memory edition. The separate
+[tmcra](https://github.com/reshuibuduo/tmcra) repository contains the full
+self-hosted platform with its service, Web and device applications. Their
+configuration and storage contracts are not interchangeable; this repository
+does not gain hosted accounts or cross-device synchronization by linking them.
+
 This repository includes an owner-local runtime. Clone it, choose an OpenAI-compatible API endpoint or a local generation model, and run the complete memory service on `127.0.0.1`. No TMCRA account or production server is required.
 
 ## Feature guide
@@ -110,8 +116,8 @@ Requirements: Python 3.12, Git with Git LFS, and at least 8 GiB system RAM. The 
 ### Windows PowerShell
 
 ```powershell
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
+git clone https://github.com/reshuibuduo/tmcra-memory.git
+cd tmcra-memory
 git lfs install
 powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
@@ -122,8 +128,8 @@ The installer asks for a credential-free OpenAI-compatible `/v1` URL, a model ID
 ### Linux or macOS
 
 ```bash
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
+git clone https://github.com/reshuibuduo/tmcra-memory.git
+cd tmcra-memory
 git lfs install
 bash scripts/install-local.sh
 bash scripts/start-local.sh
