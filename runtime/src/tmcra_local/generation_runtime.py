@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from .http_transport import open_request
+
 from .runtime_env import (
     LocalRuntimeEnvironmentError,
     _generation_contract,
@@ -169,7 +171,7 @@ def probe_generation_engine(
     )
     started = time.monotonic()
     try:
-        with (opener or urllib.request.urlopen)(
+        with (opener or open_request)(
             request, timeout=max(1.0, float(timeout_seconds))
         ) as response:
             http_status = int(response.getcode())
@@ -238,7 +240,7 @@ def _generation_health(
         f"{contract['base_url']}/health", headers=headers, method="GET"
     )
     try:
-        with urllib.request.urlopen(
+        with open_request(
             request, timeout=max(0.25, float(timeout_seconds))
         ) as response:
             return 200 <= int(response.getcode()) < 300

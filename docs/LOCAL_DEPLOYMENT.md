@@ -4,6 +4,21 @@ TMCRA Local is an owner-controlled process. Its API, databases, embedding index,
 
 ## Prerequisites
 
+### Loopback transport maintenance
+
+Python generation calls/probes and the local API smoke client bypass proxy
+settings for HTTP(S) loopback addresses, including proxies discovered from the
+operating system. They reject redirects, even to another local port. Shared
+Agent hooks also reject redirects. Configure the final endpoint directly if a
+local reverse proxy returns 3xx. Explicit remote BYOK requests retain their
+existing proxy behavior; no global network settings are changed.
+
+These boundaries are covered by synthetic loopback-server regression tests,
+not by a real-device or real-model acceptance result. The maintenance does not
+install an edge vision/audio model or change memory schemas.
+
+### Required tools
+
 - Windows 10/11, a current Linux distribution, or macOS.
 - Python 3.12 exactly.
 - Git and Git LFS.

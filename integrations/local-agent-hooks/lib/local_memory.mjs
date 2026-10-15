@@ -171,6 +171,9 @@ export async function apiRequest(config, method, path, payload, environment = pr
   try {
     const response = await fetch(`${config.baseUrl}${path}`, {
       method,
+      // A local listener must answer directly, not forward memory to another
+      // origin (including a different loopback port) through a redirect.
+      redirect: "error",
       signal: controller.signal,
       headers: {
         Accept: "application/json",

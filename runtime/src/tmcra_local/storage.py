@@ -29,6 +29,27 @@ def _text(value: Any, *, maximum: int = 0) -> str:
     return result
 
 
+def _revocation_keys(message: Mapping[str, Any]) -> tuple[str, str]:
+    """Match the two existing owner-local uniqueness constraints, without content."""
+    identities = (
+        ["message", str(message["message_id"])],
+        ["native", str(message["source_app"]), str(message["native_thread_id"]),
+         str(message["native_message_id"])],
+    )
+    return tuple(hashlib.sha256(
+        ("tmcra.local.source-revocation.1\0" + _json(identity)).encode("utf-8")
+    ).hexdigest() for identity in identities)
+
+
+def _revoke_sources(connection: sqlite3.Connection, messages: Iterable[Mapping[str, Any]]) -> None:
+    now = utc_now()
+    for message in messages:
+        connection.executemany(
+            "INSERT OR IGNORE INTO source_tombstones(identity_sha256,revoked_at) VALUES (?,?)",
+            ((key, now) for key in _revocation_keys(message)),
+        )
+
+
 class LocalStore:
     """Owner-local metadata and usage ledger.
 
@@ -87,6 +108,10 @@ class LocalStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
                     ON sessions(project_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS source_tombstones (
+                    identity_sha256 TEXT PRIMARY KEY,
+                    revoked_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -147,6 +172,10 @@ class LocalStore:
                 );
                 """
             )
+            _revoke_sources(connection, connection.execute(
+                "SELECT message_id,source_app,native_thread_id,native_message_id "
+                "FROM messages WHERE deleted_at IS NOT NULL"
+            ).fetchall())
 
     def register_message(
         self,
@@ -190,6 +219,14 @@ class LocalStore:
             if str(key).strip() and str(value).strip()
         }
         with self.transaction(immediate=True) as connection:
+            keys = _revocation_keys({
+                "message_id": stable_id, "source_app": source_app,
+                "native_thread_id": native_thread_id, "native_message_id": native_message_id,
+            })
+            if connection.execute(
+                "SELECT 1 FROM source_tombstones WHERE identity_sha256 IN (?,?)", keys
+            ).fetchone() is not None:
+                raise ValueError("message identity was permanently revoked by content deletion")
             existing = connection.execute(
                 "SELECT * FROM messages WHERE message_id=? OR "
                 "(source_app=? AND native_thread_id=? AND native_message_id=?)",
@@ -488,6 +525,10 @@ class LocalStore:
     def mark_message_deleted(self, message_id: str) -> None:
         now = utc_now()
         with self.transaction(immediate=True) as connection:
+            _revoke_sources(connection, connection.execute(
+                "SELECT message_id,source_app,native_thread_id,native_message_id "
+                "FROM messages WHERE message_id=?", (message_id,)
+            ).fetchall())
             connection.execute(
                 "UPDATE messages SET deleted_at=? WHERE message_id=?", (now, message_id)
             )
@@ -498,6 +539,10 @@ class LocalStore:
 
     def erase_message_metadata(self, message_id: str) -> bool:
         with self.transaction(immediate=True) as connection:
+            _revoke_sources(connection, connection.execute(
+                "SELECT message_id,source_app,native_thread_id,native_message_id "
+                "FROM messages WHERE message_id=?", (message_id,)
+            ).fetchall())
             deleted = connection.execute(
                 "DELETE FROM messages WHERE message_id=?", (message_id,)
             ).rowcount
@@ -511,6 +556,10 @@ class LocalStore:
 
     def delete_project_metadata(self, project_id: str) -> None:
         with self.transaction(immediate=True) as connection:
+            _revoke_sources(connection, connection.execute(
+                "SELECT message_id,source_app,native_thread_id,native_message_id "
+                "FROM messages WHERE project_id=?", (project_id,)
+            ).fetchall())
             connection.execute(
                 "DELETE FROM knowledge_documents WHERE scope_id=?",
                 ("project:" + project_id,),
