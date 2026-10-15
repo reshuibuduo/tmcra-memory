@@ -108,6 +108,10 @@ class LocalStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
                     ON sessions(project_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS local_runtime_meta (
+                    key TEXT PRIMARY KEY, value INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO local_runtime_meta VALUES('privacy_revision',0);
                 CREATE TABLE IF NOT EXISTS source_tombstones (
                     identity_sha256 TEXT PRIMARY KEY,
                     revoked_at TEXT NOT NULL
@@ -177,6 +181,10 @@ class LocalStore:
                 "FROM messages WHERE deleted_at IS NOT NULL"
             ).fetchall())
 
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+            if 'identity_metadata_json' not in columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN identity_metadata_json TEXT NOT NULL DEFAULT '{}'")
+
     def register_message(
         self,
         *,
@@ -192,6 +200,8 @@ class LocalStore:
         native_message_id: str,
         actor: Mapping[str, Any],
         message_id: str = "",
+        _after_register=None,
+        identity_metadata=None,
     ) -> tuple[dict[str, Any], bool]:
         project_id = _text(project_id, maximum=256)
         session_id = _text(session_id, maximum=512)
@@ -212,6 +222,8 @@ class LocalStore:
             f"{source_app}\0{native_thread_id}\0{native_message_id}".encode("utf-8")
         ).hexdigest()[:32]
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        from .core.entity_identity import normalize_identity_metadata
+        identity_json = _json(normalize_identity_metadata(identity_metadata))
         now = utc_now()
         actor_payload = {
             str(key): str(value)
@@ -238,8 +250,15 @@ class LocalStore:
                     or str(existing["role"]) != role
                     or str(existing["project_id"]) != project_id
                     or str(existing["session_id"]) != session_id
+                    or str(existing["identity_metadata_json"]) != identity_json
                 ):
                     raise ValueError("message identity was already used for different content")
+                if str(existing["actor_json"]) != _json(actor_payload):
+                    # A replay may neither promote an unknown source to human
+                    # nor replace any producer/capture declaration in place.
+                    raise ValueError("message identity was already used with different actor provenance")
+                if _after_register is not None:
+                    _after_register(connection, dict(existing), False)
                 return dict(existing), False
             existing_session = connection.execute(
                 "SELECT project_id FROM sessions WHERE session_id=?", (session_id,)
@@ -299,9 +318,12 @@ class LocalStore:
                     now,
                 ),
             )
+            connection.execute("UPDATE messages SET identity_metadata_json=? WHERE message_id=?", (identity_json, stable_id))
             row = connection.execute(
                 "SELECT * FROM messages WHERE message_id=?", (stable_id,)
             ).fetchone()
+            if _after_register is not None:
+                _after_register(connection, dict(row), True)
             return dict(row), True
 
     def message(self, message_id: str) -> dict[str, Any] | None:
@@ -313,19 +335,22 @@ class LocalStore:
             return None
         result = dict(row)
         result["actor"] = json.loads(str(result.pop("actor_json") or "{}"))
+        result["identity_metadata"] = json.loads(result.pop("identity_metadata_json", "{}"))
         return result
 
-    def messages_for_session(self, session_id: str) -> list[dict[str, Any]]:
+    def messages_for_session(self, session_id: str, *, include_deleted: bool = False) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT * FROM messages WHERE session_id=? AND deleted_at IS NULL "
-                "ORDER BY message_index",
+                "SELECT * FROM messages WHERE session_id=? "
+                + ("" if include_deleted else "AND deleted_at IS NULL ")
+                + "ORDER BY message_index",
                 (session_id,),
             ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
             item["actor"] = json.loads(str(item.pop("actor_json") or "{}"))
+            item["identity_metadata"] = json.loads(item.pop("identity_metadata_json", "{}"))
             results.append(item)
         return results
 
@@ -335,10 +360,11 @@ class LocalStore:
         project_id: str = "",
         session_id: str = "",
         limit: int = 200,
+        include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         """List owner-local source messages so users can inspect and delete them."""
 
-        clauses = ["deleted_at IS NULL"]
+        clauses = ["1=1" if include_deleted else "deleted_at IS NULL"]
         values: list[Any] = []
         if project_id:
             clauses.append("project_id=?")
@@ -359,6 +385,7 @@ class LocalStore:
         for row in rows:
             item = dict(row)
             item["actor"] = json.loads(str(item.pop("actor_json") or "{}"))
+            item["identity_metadata"] = json.loads(item.pop("identity_metadata_json", "{}"))
             results.append(item)
         return results
 
@@ -415,6 +442,9 @@ class LocalStore:
         if status not in {"pending", "processing", "committed", "failed", "deleted"}:
             raise ValueError("invalid message scope status")
         with self.transaction(immediate=True) as connection:
+            active = connection.execute("SELECT deleted_at FROM messages WHERE message_id=?", (message_id,)).fetchone()
+            if active is None or (active["deleted_at"] and status != 'deleted'):
+                return
             connection.execute(
                 "INSERT INTO message_scopes(message_id,scope_id,status,source_record_id,error,updated_at) "
                 "VALUES(?,?,?,?,?,?) ON CONFLICT(message_id,scope_id) DO UPDATE SET "
@@ -522,9 +552,14 @@ class LocalStore:
         result["payload"] = json.loads(str(result.pop("payload_json")))
         return result
 
+    def privacy_revision(self) -> int:
+        with self.transaction() as connection:
+            return int(connection.execute("SELECT value FROM local_runtime_meta WHERE key='privacy_revision'").fetchone()[0])
+
     def mark_message_deleted(self, message_id: str) -> None:
         now = utc_now()
         with self.transaction(immediate=True) as connection:
+            connection.execute("UPDATE local_runtime_meta SET value=value+1 WHERE key='privacy_revision'")
             _revoke_sources(connection, connection.execute(
                 "SELECT message_id,source_app,native_thread_id,native_message_id "
                 "FROM messages WHERE message_id=?", (message_id,)

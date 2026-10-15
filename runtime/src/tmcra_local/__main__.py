@@ -168,6 +168,7 @@ def _configure(args: argparse.Namespace) -> int:
         generation_profile_id=args.generation_profile,
         local_generation_base_url=args.local_generation_base_url,
         generation_runtime_executable=args.generation_runtime_executable,
+        runtime_mode=getattr(args, "runtime_mode", "enrich"),
     )
     if args.dry_run:
         path = config_root / "runtime" / "local-runtime.json"
@@ -349,14 +350,12 @@ def _start(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser().resolve()
     payload = load_local_runtime_config(config_path)
     with managed_local_generation(
-        config_path, startup_timeout_seconds=args.generation_startup_timeout
+        config_path, startup_timeout_seconds=args.generation_startup_timeout,
+        runtime_mode_override=getattr(args, 'runtime_mode', None),
     ):
-        environment = build_service_environment(
-            payload,
-            config_path=config_path,
-            require_model=not args.allow_missing_model,
-        )
-        app = create_app(config_path, verify_models=not args.allow_missing_model)
+        app = create_app(config_path, verify_models=not args.allow_missing_model,
+                         runtime_mode_override=getattr(args, 'runtime_mode', None))
+        environment = app.state.engine.environment
         uvicorn.run(
             app,
             host=environment["TMCRA_SERVICE_BIND_HOST"],
@@ -415,6 +414,16 @@ def _doctor(args: argparse.Namespace) -> int:
 
     config_path = Path(args.config).expanduser().resolve()
     payload = load_local_runtime_config(config_path)
+    from .runtime_modes import runtime_mode, read_only_environment, RuntimeModeError
+    mode = runtime_mode(payload)
+    if mode != 'enrich':
+        if args.probe_models or args.probe_generation:
+            raise RuntimeModeError(mode, 'model probe')
+        environment = read_only_environment(payload, config_path)
+        _emit({'status': 'off' if mode == 'off' else 'ready', 'runtime_mode': mode,
+               'checks': {'config': 'passed', 'generation': 'disabled', 'model_initialization': 'not_performed'},
+               'contains_secret_values': False}, compact=args.json)
+        return 0
     environment = build_service_environment(
         payload,
         config_path=config_path,
@@ -496,6 +505,7 @@ def parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=_plan)
 
     configure = sub.add_parser("configure", help="write a secret-free local runtime policy")
+    configure.add_argument("--mode", dest="runtime_mode", choices=["off", "read-only", "enrich"], default="enrich")
     configure.add_argument("--embedding", required=True)
     configure.add_argument(
         "--reranker",
@@ -596,6 +606,7 @@ def parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--access-log", action="store_true")
     start.add_argument("--generation-startup-timeout", type=float, default=300.0)
+    start.add_argument("--mode", dest="runtime_mode", choices=["off", "read-only", "enrich"], default=None, help="override runtime mode for this invocation only")
     start.set_defaults(handler=_start)
 
     token = sub.add_parser("token", help="create or inspect the local API token path")

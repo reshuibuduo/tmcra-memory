@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import logging
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,6 +38,7 @@ class MessageIn(BaseModel):
     session_title: str = Field(default="", max_length=200)
     occurred_at: str = Field(default="", max_length=80)
     actor: dict[str, Any] = Field(default_factory=dict)
+    identity_metadata: dict[str, Any] = Field(default_factory=dict)
     visibility: Literal["project", "global", "both"] = "project"
     message_id: str = Field(default="", max_length=512)
 
@@ -51,14 +53,24 @@ def create_app(
     config_path: str | Path,
     *,
     verify_models: bool = True,
+    runtime_mode_override=None,
 ) -> FastAPI:
-    engine = LocalMemoryEngine(config_path, verify_models=verify_models)
+    engine = LocalMemoryEngine(config_path, verify_models=verify_models, runtime_mode_override=runtime_mode_override)
     installation = engine.config.get("installation")
     if not isinstance(installation, Mapping):
         raise RuntimeError("local runtime installation config is missing")
     token_file, token, _ = ensure_local_token(str(installation.get("config_root") or ""))
 
+    @asynccontextmanager
+    async def lifespan(_app):
+        engine.start_worker()
+        try:
+            yield
+        finally:
+            engine.close()
+
     app = FastAPI(
+        lifespan=lifespan,
         title="TMCRA Local Memory API",
         version="0.1.0",
         description=(
@@ -89,6 +101,11 @@ def create_app(
             content={"error": "InternalServerError", "detail": "local runtime failure"},
         )
 
+    from .runtime_modes import RuntimeModeError
+    @app.exception_handler(RuntimeModeError)
+    async def mode_error(_, exc):
+        return JSONResponse(status_code=403, content={'error': 'runtime_mode_disabled', 'runtime_mode': exc.mode, 'detail': str(exc)})
+
     from .workflows import WorkflowError
     from .memory_bridge import BridgeError
 
@@ -114,13 +131,12 @@ def create_app(
 
     @app.get("/v1/projects/{project_id}/workflows", dependencies=[Depends(authorize)])
     def workflow_snapshot(project_id: str, as_of: str | None = Query(default=None, max_length=80)):
-        with engine._lock:
-            return engine.workflows.snapshot(project_id, as_of=as_of)
+        return engine.workflows.snapshot(project_id, as_of=as_of)
 
     @app.post("/v1/projects/{project_id}/workflows", dependencies=[Depends(authorize)])
     def workflow_action(project_id: str, body: WorkflowIn):
-        with engine._lock:
-            return engine.workflows.execute(project_id, body.action, body.payload, body.operation_id)
+        engine.require_enrich('workflow action')
+        return engine.workflows.execute(project_id, body.action, body.payload, body.operation_id)
 
     @app.get("/v1/health")
     def health() -> dict[str, Any]:
@@ -154,6 +170,28 @@ def create_app(
         if not values["native_thread_id"]:
             values["native_thread_id"] = values["session_id"]
         return engine.ingest_message(**values)
+
+    @app.post("/v1/message-jobs", dependencies=[Depends(authorize)], status_code=202)
+    def enqueue(payload: MessageIn):
+        values = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
+        if not values['native_thread_id']:
+            values['native_thread_id'] = values['session_id']
+        return engine.enqueue_message(**values)
+
+    @app.get("/v1/message-jobs/{job_id}", dependencies=[Depends(authorize)])
+    def job(job_id: str):
+        result = engine.job_status(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail='job does not exist')
+        return result
+
+    class RetryIn(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        confirmed: bool = False
+
+    @app.post("/v1/message-jobs/{job_id}/retry", dependencies=[Depends(authorize)], status_code=202)
+    def retry(job_id: str, payload: RetryIn):
+        return engine.retry_job(job_id, confirmed=payload.confirmed)
 
     @app.delete("/v1/messages/{message_id}", dependencies=[Depends(authorize)])
     def delete_message(message_id: str) -> dict[str, Any]:

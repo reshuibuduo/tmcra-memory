@@ -1,3 +1,4 @@
+import { classifyPromptOrigin, permitsPromptCapture, normalizeQueuedOrigin } from "./prompt_origin.mjs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -144,6 +145,9 @@ export async function loadConfig(environment = process.env) {
   if (!tokenFile || !existsSync(tokenFile)) {
     throw new Error("TMCRA local API token file is unavailable");
   }
+  if (payload.ingestionMode !== undefined && !["sync", "async"].includes(payload.ingestionMode)) {
+    throw new Error("TMCRA integration ingestionMode must be sync or async");
+  }
   const topK = Number(payload.topK ?? 8);
   return {
     path,
@@ -151,6 +155,7 @@ export async function loadConfig(environment = process.env) {
     tokenFile,
     stateDir,
     topK: Number.isSafeInteger(topK) && topK >= 1 && topK <= 32 ? topK : 8,
+    ingestionMode: payload.ingestionMode === "async" ? "async" : "sync",
     userVisibility: ["project", "global", "both"].includes(payload.userVisibility)
       ? payload.userVisibility
       : "both",
@@ -182,7 +187,11 @@ export async function apiRequest(config, method, path, payload, environment = pr
       },
       body: payload === undefined ? undefined : JSON.stringify(payload),
     });
-    if (!response.ok) throw new Error(`TMCRA local API returned HTTP ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(`TMCRA local API returned HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     const value = await response.json();
     if (!value || Array.isArray(value) || typeof value !== "object") {
       throw new Error("TMCRA local API returned an invalid JSON object");
@@ -311,45 +320,105 @@ async function queueOutbox(config, payload) {
   });
 }
 
+// Metadata-only receipts: never include text, tokens, paths or arbitrary error text.
+function originReceipt(origin, status) {
+  process.stderr.write(`${JSON.stringify({event:"tmcra_capture", status,
+    reason: status === "skipped" ? "automatic_origin_excluded" : "origin_unverified_source_only",
+    origin_kind: origin.origin_kind || "unknown"})}\n`);
+}
+
+async function ingestionReceipt(config, payload, result) {
+  const key = hash([payload.project_id, payload.session_id, payload.native_message_id].join("\0"), 40);
+  await atomicJson(join(config.stateDir, "receipts", `${key}.json`), {
+    schemaVersion: STATE_SCHEMA, recordedAt: new Date().toISOString(),
+    status: result.status, accepted: result.accepted === true, indexed: result.indexed === true,
+    ...(result.engine_state ? {engine_state: result.engine_state} : {}),
+    derived_indexed: result.derived_indexed === true,
+    semantic_processing: result.semantic_processing || "unknown",
+    ...(typeof result.job_id === "string" ? {job_id: result.job_id} : {}),
+    ...(result.error_code ? {error_code: result.error_code} : {}),
+  });
+}
+
+async function dispatchMessage(config, payload, environment) {
+  const asynchronous = config.ingestionMode === "async";
+  const result = await apiRequest(config, "POST", asynchronous ? "/v1/message-jobs" : "/v1/messages", payload, environment);
+  if (asynchronous && (result.accepted !== true || typeof result.job_id !== "string")) {
+    throw new Error("TMCRA async ingestion returned an invalid acceptance receipt");
+  }
+  const receipt = asynchronous ? {...result, engine_state: result.status, status: result.indexed === true ? "indexed" : (["failed", "retryable_failed", "permanent_failed", "interrupted", "cancelled"].includes(result.status) ? result.status : "accepted_pending")}
+    : {...result, status:"committed", accepted:true, indexed:true};
+  await ingestionReceipt(config, payload, receipt);
+  return receipt;
+}
+
+function permanentIngestError(error) {
+  return [400, 401, 403, 409, 413, 422].includes(error?.status);
+}
+
+async function recordIngestFailure(config, payload, error) {
+  const unsupported = config.ingestionMode === "async" && error?.status === 404;
+  await ingestionReceipt(config, payload, {status: permanentIngestError(error) ? "rejected" : "queued",
+    error_code: unsupported ? "async_unsupported" : (error?.status ? `http_${error.status}` : "transport_unavailable")});
+}
+
 export async function flushOutbox(config, environment = process.env) {
   const directory = join(config.stateDir, "outbox");
   let files = [];
   try {
     files = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort();
   } catch (error) {
-    if (error?.code === "ENOENT") return { attempted: 0, committed: 0 };
+    if (error?.code === "ENOENT") return { attempted: 0, committed: 0, accepted:0, rejected:0, skipped:0 };
     throw error;
   }
-  let committed = 0;
+  let committed = 0, accepted = 0, rejected = 0, skipped = 0;
   for (const name of files.slice(0, MAX_OUTBOX_BATCH)) {
     const path = join(directory, name);
+    let payload;
     try {
       const item = JSON.parse(await readFile(path, "utf8"));
       if (item?.schemaVersion !== STATE_SCHEMA || !item.payload) {
         await rm(path, { force: true });
         continue;
       }
-      await apiRequest(config, "POST", "/v1/messages", item.payload, environment);
+      const origin = normalizeQueuedOrigin(item.payload.actor || {}, item.payload.role);
+      if (item.payload.role === "user" && !permitsPromptCapture(origin)) {
+        originReceipt(origin, "skipped");
+        await rm(path, { force: true });
+        skipped += 1;
+        continue;
+      }
+      payload = { ...item.payload, actor: origin };
+      const result = await dispatchMessage(config, payload, environment);
       await rm(path, { force: true });
-      committed += 1;
-    } catch {
+      if (result.indexed) committed += 1;
+      else accepted += 1;
+    } catch (error) {
+      if (payload) await recordIngestFailure(config, payload, error);
+      if (permanentIngestError(error)) {
+        await rm(path, {force:true});
+        rejected += 1;
+        continue; // A rejected entry must not block later independent items.
+      }
       break;
     }
   }
-  return { attempted: Math.min(files.length, MAX_OUTBOX_BATCH), committed };
+  return { attempted: Math.min(files.length, MAX_OUTBOX_BATCH), committed, accepted, rejected, skipped };
 }
 
 export async function rememberMessage(config, payload, environment = process.env) {
   try {
-    await apiRequest(config, "POST", "/v1/messages", payload, environment);
-    return "committed";
-  } catch {
+    const result = await dispatchMessage(config, payload, environment);
+    return result.indexed ? "committed" : result.status;
+  } catch (error) {
+    await recordIngestFailure(config, payload, error);
+    if (permanentIngestError(error)) return "rejected";
     await queueOutbox(config, payload);
     return "queued";
   }
 }
 
-function messagePayload({ project, session, platform, role, content, nativeMessageId, visibility }) {
+function messagePayload({ project, session, platform, role, content, nativeMessageId, visibility, origin }) {
   const isUser = role === "user";
   return {
     project_id: project.projectId,
@@ -365,9 +434,10 @@ function messagePayload({ project, session, platform, role, content, nativeMessa
     actor: {
       actor_id: isUser ? "owner" : `${platform}:assistant`,
       actor_role: role,
-      actor_type: isUser ? "human" : "agent",
+      actor_type: isUser ? "unspecified" : "agent",
       actor_name: isUser ? "User" : `${platform} agent`,
       agent_platform: platform,
+      ...(origin || { origin_kind: "assistant_generated", capture_method: "host_event_metadata", provenance_strength: "host_declared" }),
     },
   };
 }
@@ -417,6 +487,9 @@ export async function workflowContext(config, project, session, event, eventId, 
 }
 
 export async function handleUserPrompt(input, platform, environment = process.env) {
+  const origin = classifyPromptOrigin(input);
+  if (!permitsPromptCapture(origin)) { originReceipt(origin, "skipped"); return response(); }
+  if (origin.origin_kind === "unknown") originReceipt(origin, "source_only");
   const prompt = redactSensitiveText(input.prompt || input.user_prompt || input.message || "");
   if (!prompt) return response();
   const config = await loadConfig(environment);
@@ -458,6 +531,7 @@ export async function handleUserPrompt(input, platform, environment = process.en
     content: prompt,
     nativeMessageId: `${id}:user`,
     visibility: config.userVisibility,
+    origin,
   }), environment);
   return response([context, await workflow].filter(Boolean).join("\n\n"));
 }
@@ -517,7 +591,9 @@ export async function writeIntegrationConfig({
   topK = 8,
   userVisibility = "both",
   workflowPython = "",
+  ingestionMode = "async",
 }) {
+  if (!["sync", "async"].includes(ingestionMode)) throw new Error("ingestionMode must be sync or async");
   const runtime = JSON.parse(await readFile(resolve(runtimeConfigPath), "utf8"));
   const configRoot = String(runtime?.installation?.config_root || "").trim();
   if (!configRoot) throw new Error("local runtime config has no installation.config_root");
@@ -530,6 +606,7 @@ export async function writeIntegrationConfig({
     stateDir: resolve(stateDir),
     topK,
     userVisibility,
+    ingestionMode: ingestionMode === "sync" ? "sync" : "async",
     ...(workflowPython ? { workflowPython: resolve(workflowPython) } : {}),
   };
   const target = resolve(outputPath);

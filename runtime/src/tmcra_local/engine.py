@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .actor_provenance import normalize_message_actor_metadata
+from .actor_provenance import normalize_message_actor_metadata, origin_metadata, source_authority, permits_human_preference
 from .auth import restrict_owner_directory
 from .core import RealGraphFactory, V4BatchStore, V4BatchWriter
 from .core_loader import graph_core_root
@@ -27,6 +27,8 @@ from .personal_knowledge import (
 )
 from .runtime_env import build_service_environment, load_local_runtime_config
 from .storage import LocalStore, utc_now
+from .ingest_queue import DurableIngestQueue, InferenceLock, ProcessWriterLease, SourceChanged, classify_failure
+from .runtime_modes import runtime_mode, read_only_environment, RuntimeModeError
 from .visual_atlas import build_visual_atlas, validate_visual_atlas
 
 
@@ -67,14 +69,15 @@ def _lexical_terms(value: Any) -> set[str]:
 class LocalMemoryEngine:
     """Complete owner-local TMCRA write, recall, graph, and knowledge runtime."""
 
-    def __init__(self, config_path: str | Path, *, verify_models: bool = True) -> None:
+    def __init__(self, config_path: str | Path, *, verify_models: bool = True, runtime_mode_override=None) -> None:
         self.config_path = Path(config_path).expanduser().resolve()
         self.config = load_local_runtime_config(self.config_path)
-        self.environment = build_service_environment(
-            self.config,
-            config_path=self.config_path,
-            require_model=verify_models,
-        )
+        self.runtime_mode = runtime_mode(self.config, runtime_mode_override)
+        if self.runtime_mode == 'off':
+            raise RuntimeModeError('off', 'service startup')
+        self.environment = (read_only_environment(self.config, self.config_path)
+            if self.runtime_mode == 'read-only' else build_service_environment(
+                self.config, config_path=self.config_path, require_model=verify_models))
         # The imported graph core reads its non-secret runtime switches from the
         # process environment. Provider credentials stay on the in-process LLM
         # client so subprocesses started later cannot inherit the user's key.
@@ -95,7 +98,16 @@ class LocalMemoryEngine:
         # atomic transaction inside the graph adapter.
         algorithm_database = state_dir / "memory.sqlite3"
         self.writer_store = V4BatchStore(algorithm_database)
-        self._lock = threading.RLock()
+        self._lock = InferenceLock()
+        self._workflow_lock = threading.RLock()
+        self._writer_lease = ProcessWriterLease(state_dir / '.writer.lock')
+        self.jobs = DurableIngestQueue(self.store)
+        self._worker = None
+        self._worker_stop = threading.Event()
+        self._worker_wake = threading.Event()
+        self._worker_guard = threading.Lock()
+        self._reader_factory = None
+        self._reader_settings = None
         self._usage_context = threading.local()
         self.graph_factory = RealGraphFactory(
             repo=graph_core_root(),
@@ -113,6 +125,10 @@ class LocalMemoryEngine:
                 or key.startswith("TMCRA_WRITE_EMBEDDER_")
             },
         )
+        if self.runtime_mode == 'read-only':
+            self.llm = None
+            self.writer = None
+            return
         llm = OpenAICompatibleClient(
             base_url=self.environment["TMCRA_WRITER_BASE_URL"],
             model=self.environment["TMCRA_WRITER_MODEL"],
@@ -131,6 +147,172 @@ class LocalMemoryEngine:
             graph_factory=self.graph_factory,
             log_dir=None,
         )
+
+    def require_enrich(self, operation="write"):
+        if self.runtime_mode != 'enrich':
+            raise RuntimeModeError(self.runtime_mode, operation)
+
+    def _read_backend(self, scope_id):
+        # Never return the writer's possibly uncommitted mutation_batch objects.
+        factory = self.graph_factory
+        settings = (factory.retrieval_mode, factory.node_model_path, factory.path_model_path,
+                    factory.node_model_device, tuple(sorted(factory.graph_environment.items())))
+        if self._reader_factory is None or self._reader_settings != settings:
+            self._reader_factory = RealGraphFactory(repo=factory.repo, database=factory.database,
+                retrieval_mode=factory.retrieval_mode, node_model_path=factory.node_model_path,
+                path_model_path=factory.path_model_path, node_model_device=factory.node_model_device,
+                graph_environment=factory.graph_environment)
+            self._reader_settings = settings
+        backend = self._reader_factory.for_scope(scope_id)
+        backend._reload(force=True)
+        return backend
+
+    @contextmanager
+    def _model_boundary(self, message_id=None):
+        epoch = self.store.privacy_revision()
+        with self._lock.suspended():
+            yield
+        # Reacquired graph lock before interpreting or committing model output.
+        row = self.store.message(message_id) if message_id else None
+        if message_id and (not row or row.get('deleted_at')):
+            raise SourceChanged('source deletion invalidated the in-flight model result', source_deleted=True)
+        if self.store.privacy_revision() != epoch:
+            raise SourceChanged('context deletion invalidated the in-flight model result')
+
+    @contextmanager
+    def _writer_model_boundaries(self, message_id):
+        engine = self
+        class ClientBoundary:
+            def __init__(self, client):
+                self.client = client
+            def __getattr__(self, name):
+                value = getattr(self.client, name)
+                if name not in {'complete', 'reconcile', 'complete_json'} or not callable(value):
+                    return value
+                def invoke(*args, **kwargs):
+                    with engine._model_boundary(message_id):
+                        return value(*args, **kwargs)
+                return invoke
+        originals = (self.writer.flash_client, self.writer.pro_client)
+        self.writer.flash_client, self.writer.pro_client = map(ClientBoundary, originals)
+        try:
+            yield
+        finally:
+            self.writer.flash_client, self.writer.pro_client = originals
+
+    def enqueue_message(self, **values):
+        self.require_enrich('enqueue')
+        values = dict(values)
+        scopes = self._scope_ids(values['project_id'], values.pop('visibility', 'project'))
+        values['actor'] = normalize_message_actor_metadata(values['role'], values.get('actor') or {})
+        for key in ('project_title', 'session_title', 'occurred_at', 'message_id'):
+            values.setdefault(key, '')
+        values.setdefault('source_app', 'manual')
+        values.setdefault('native_thread_id', values['session_id'])
+        values.setdefault('native_message_id', '')
+        with self._lock:
+            message, _ = self.store.register_message(**values, _after_register=self.jobs.admission(scopes))
+        result = self.job_status(self.jobs.for_message(message['message_id'])['job_id'])
+        self.start_worker()
+        self._worker_wake.set()
+        return result
+
+    def job_status(self, job_id):
+        with self._lock:
+            result = self.jobs.get(job_id)
+            if result is None:
+                return None
+            row = self.store.message(result['message_id'])
+            derived = False
+            processing = 'pending'
+            if result['status'] == 'cancelled':
+                processing = 'cancelled'
+            elif result['indexed'] and row and not row.get('deleted_at'):
+                processing = ('skipped_origin_unverified' if row['role'] == 'user'
+                    and not permits_human_preference(row.get('actor', {})) else 'completed')
+                for scope in self.store.scopes_for_message(row['message_id']):
+                    backend = self._read_backend(scope['scope_id'])
+                    records = backend.adapter.graph.records_by_id
+                    source_ids = {key for key, record in records.items()
+                        if _record_payload(record).get('metadata', {}).get('message_id') == row['message_id']
+                        and _record_payload(record).get('metadata', {}).get('content_variant') == 'source_message'}
+                    for record in records.values():
+                        meta = _record_payload(record).get('metadata', {})
+                        refs = set(meta.get('source_record_ids') or []) | {meta.get('source_record_id')}
+                        if meta.get('content_variant') != 'source_message' and refs & source_ids:
+                            derived = True
+            elif result['status'] in {'retryable_failed', 'permanent_failed', 'interrupted'}:
+                processing = result['status']
+            result.update(derived_indexed=derived, semantic_processing=processing)
+            return result
+
+    def retry_job(self, job_id, *, confirmed=False):
+        self.require_enrich('retry')
+        result = self.jobs.retry(job_id, confirmed=confirmed)
+        self.start_worker(); self._worker_wake.set()
+        return self.job_status(job_id)
+
+    def start_worker(self):
+        if self.runtime_mode != 'enrich':
+            return
+        with self._worker_guard:
+            if self._worker and self._worker.is_alive():
+                return
+            self._worker_stop.clear()
+            self._worker = threading.Thread(target=self._worker_loop, name='tmcra-ingest-worker', daemon=True)
+            self._worker.start()
+
+    def close(self):
+        self._worker_stop.set(); self._worker_wake.set()
+        if self._worker:
+            self._worker.join(timeout=2)
+
+    def _worker_loop(self):
+        while not self._worker_stop.is_set():
+            try:
+                processed = self.run_next_job()
+            except Exception:
+                # Running receipt remains durable and recoverable; do not spin.
+                processed = False
+            if not processed:
+                self._worker_wake.wait(.25)
+                self._worker_wake.clear()
+
+    def run_next_job(self):
+        self.require_enrich('process jobs')
+        with self._writer_lease.acquire(blocking=False) as acquired:
+            if not acquired:
+                return False
+            self.jobs.recover_interrupted()
+            job = self.jobs.claim()
+            if job is None:
+                return False
+            message = self.store.message(job['message_id'])
+            if not message or message.get('deleted_at'):
+                self.jobs.finish(job['message_id'], 'cancelled', 'source_deleted')
+                return True
+            scope_ids = json.loads(job['scope_ids_json'])
+            if job['attempts'] > 0:
+                # Only an explicitly requeued attempt may discard an incomplete
+                # writer journal and issue a new call after an unknown outcome.
+                for scope in scope_ids:
+                    old = self.store.scope_status(message['message_id'], scope)
+                    if old and old['status'] != 'committed':
+                        self.store.set_scope_status(message_id=message['message_id'], scope_id=scope,
+                                                    status='failed', error='explicit_retry')
+            visibility = 'both' if len(scope_ids) == 2 else ('global' if scope_ids == [self.global_scope()] else 'project')
+            try:
+                self.ingest_message(project_id=message['project_id'], session_id=message['session_id'],
+                    role=message['role'], content=message['content'], source_app=message['source_app'],
+                    native_thread_id=message['native_thread_id'], native_message_id=message['native_message_id'],
+                    message_id=message['message_id'], occurred_at=message['occurred_at'], actor=message['actor'],
+                    visibility=visibility, identity_metadata=message.get("identity_metadata", {}))
+            except Exception as exc:
+                state, code = classify_failure(exc)
+                self.jobs.finish(message['message_id'], state, code)
+            else:
+                self.jobs.finish(message['message_id'], 'indexed')
+            return True
 
     @property
     def workflows(self):
@@ -188,9 +370,11 @@ class LocalMemoryEngine:
         actor: Mapping[str, Any] | None = None,
         visibility: str = "project",
         message_id: str = "",
+        identity_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self.require_enrich('ingest')
         actor_payload = normalize_message_actor_metadata(role, actor or {})
-        with self._lock, self._usage_for(project_id, session_id):
+        with self._writer_lease.acquire(), self._lock, self._usage_for(project_id, session_id):
             message, created = self.store.register_message(
                 project_id=project_id,
                 project_title=project_title,
@@ -204,7 +388,12 @@ class LocalMemoryEngine:
                 native_message_id=native_message_id,
                 actor=actor_payload,
                 message_id=message_id,
+                identity_metadata=identity_metadata,
             )
+            # Construct writer input only from the immutable admitted row, not
+            # metadata supplied by a later sync/async replay request.
+            persisted_actor = json.loads(str(message.get("actor_json") or "{}"))
+            persisted_identity = json.loads(str(message.get("identity_metadata_json") or "{}"))
             scope_ids = self._scope_ids(project_id, visibility)
             statuses: list[dict[str, Any]] = []
             for scope_id in scope_ids:
@@ -234,15 +423,17 @@ class LocalMemoryEngine:
                         {
                             "message_id": message["message_id"],
                             "message_index": int(message["message_index"]),
-                            "role": role,
-                            "content": content,
-                            "timestamp": occurred_at or message["occurred_at"],
-                            "actor_metadata": actor_payload,
+                            "role": message["role"],
+                            "content": message["content"],
+                            "timestamp": message["occurred_at"],
+                            "actor_metadata": persisted_actor,
+                            "identity_metadata": persisted_identity,
                         }
                     ],
                 }
                 try:
-                    self.writer.run([row])
+                    with self._writer_model_boundaries(message['message_id']):
+                        self.writer.run([row])
                     source = self.writer_store.source_info(scope_id, message["message_id"])
                     source_record_id = str(source.get("source_record_id") or "")
                     self.store.set_scope_status(
@@ -256,11 +447,12 @@ class LocalMemoryEngine:
                         message_id=message["message_id"],
                         scope_id=scope_id,
                         status="failed",
-                        error=f"{exc.__class__.__name__}: {exc}",
+                        error=classify_failure(exc)[1],
                     )
                     raise
                 status = self.store.scope_status(message["message_id"], scope_id)
                 statuses.append(dict(status or {}))
+            self.jobs.finish(message['message_id'], 'indexed')
             return {
                 "schema_version": "tmcra.local.ingest-result.1",
                 "message_id": message["message_id"],
@@ -272,7 +464,7 @@ class LocalMemoryEngine:
             }
 
     def _window_for_hit(self, scope_id: str, hit: Mapping[str, Any]) -> dict[str, Any]:
-        backend = self.graph_factory.for_scope(scope_id)
+        backend = self._reader_factory.for_scope(scope_id)
         metadata = dict(hit.get("metadata") or {})
         memory_id = _clean(hit.get("memory_id"), maximum=512)
         source_id = _clean(metadata.get("source_record_id"), maximum=512)
@@ -302,13 +494,8 @@ class LocalMemoryEngine:
             "timestamp": source_meta.get("timestamp") or metadata.get("timestamp"),
             "session_id": source_meta.get("session_id") or metadata.get("session_id"),
             "actor_role": actor_role,
-            "authority": (
-                "user_source"
-                if actor_role == "user"
-                else "assistant_source"
-                if actor_role == "assistant"
-                else "non_user_source"
-            ),
+            "authority": source_authority({**metadata, **source_meta, 'actor_role': actor_role}),
+            **origin_metadata({**metadata, **source_meta}),
             "score": float(hit.get("score") or 0.0),
             "memory_contexts": [],
             "attachments": [],
@@ -325,13 +512,8 @@ class LocalMemoryEngine:
                 "timestamp": metadata.get("timestamp"),
                 "session_id": metadata.get("session_id"),
                 "actor_role": actor_role,
-                "authority": (
-                    "derived_user_memory"
-                    if actor_role == "user"
-                    else "derived_assistant_memory"
-                    if actor_role == "assistant"
-                    else "unattributed_derived_memory"
-                ),
+                "authority": source_authority({**metadata, **source_meta, 'actor_role': actor_role}, derived=True),
+                **origin_metadata({**metadata, **source_meta}),
                 "role": "context",
                 "source_record_id": source_id,
             }
@@ -392,7 +574,26 @@ class LocalMemoryEngine:
             key=lambda item: (-float(item["score"]), str(item["memory_id"])),
         )[: max(1, int(limit))]
 
+    def _hit_visible(self, scope_id, hit):
+        metadata = dict(hit.get('metadata') or {})
+        graph = self._reader_factory.for_scope(scope_id).adapter.graph
+        identifiers = list(metadata.get('source_record_ids') or [])
+        identifiers += [metadata.get('source_record_id'), hit.get('memory_id')]
+        checked = []
+        for identifier in identifiers:
+            record = graph.records_by_id.get(identifier)
+            meta = _record_payload(record).get('metadata', {}) if record is not None else {}
+            message_id = meta.get('message_id') or meta.get('source_message_id')
+            if message_id:
+                row = self.store.message(str(message_id))
+                checked.append(bool(row and not row.get('deleted_at')))
+        return all(checked) if checked else False
+
     def recall(self, *, project_id: str, query: str, top_k: int = 8) -> dict[str, Any]:
+        with self._lock:
+            return self._recall_locked(project_id=project_id, query=query, top_k=top_k)
+
+    def _recall_locked(self, *, project_id: str, query: str, top_k: int = 8) -> dict[str, Any]:
         project_id = _clean(project_id, maximum=256)
         query = str(query or "").strip()
         if not project_id or not query:
@@ -403,7 +604,7 @@ class LocalMemoryEngine:
         traces: list[dict[str, Any]] = []
         with self._lock:
             for scope_id in scope_ids:
-                backend = self.graph_factory.for_scope(scope_id)
+                backend = self._read_backend(scope_id)
                 retrieval = backend.adapter.retrieve(query, top_k=max(top_k, 12))
                 payload = retrieval.to_dict()
                 source_hits = self._source_hits(
@@ -420,7 +621,7 @@ class LocalMemoryEngine:
                     }
                 )
                 for hit in [*(payload.get("hits") or []), *source_hits]:
-                    if not isinstance(hit, Mapping):
+                    if not isinstance(hit, Mapping) or not self._hit_visible(scope_id, hit):
                         continue
                     candidates.append({**dict(hit), "scope_id": scope_id})
         ranked = sorted(
@@ -471,7 +672,7 @@ class LocalMemoryEngine:
         if not sessions:
             raise LocalEngineError("project has no sessions")
         scope_id = self.project_scope(project_id)
-        graph = self.graph_factory.for_scope(scope_id).adapter.graph
+        graph = self._read_backend(scope_id).adapter.graph
         source_graphs: dict[str, dict[str, Any]] = {}
         for session in sessions:
             session_id = str(session["session_id"])
@@ -480,6 +681,8 @@ class LocalMemoryEngine:
             for record in graph.records_by_id.values():
                 payload = _record_payload(record)
                 metadata = dict(payload.get("metadata") or {})
+                if not self._hit_visible(scope_id, payload):
+                    continue
                 if str(metadata.get("session_id") or "") != session_id:
                     continue
                 memory_id = str(payload.get("memory_id") or "")
@@ -541,13 +744,16 @@ class LocalMemoryEngine:
         return sessions, source_graphs
 
     def visual_atlas(self, *, project_id: str) -> dict[str, Any]:
-        sessions, source_graphs = self._project_graph_inputs(project_id)
+        with self._lock:
+            sessions, source_graphs = self._project_graph_inputs(project_id)
         atlas = build_visual_atlas(
             self.project_scope(project_id), sessions, source_graphs=source_graphs
         )
         return validate_visual_atlas(atlas)
 
     def build_knowledge(self, *, project_id: str) -> dict[str, Any]:
+        self.require_enrich('knowledge build')
+        knowledge_epoch = self.store.privacy_revision()
         atlas = self.visual_atlas(project_id=project_id)
         source_fingerprint = personal_knowledge_source_fingerprint(atlas)
         enabled = (
@@ -563,12 +769,13 @@ class LocalMemoryEngine:
             call_metadata: list[dict[str, Any]] = []
             with self._lock, self._usage_for(project_id, ""):
                 for batch in batches:
-                    raw, metadata = self.llm.complete_json(
-                        system_prompt=PERSONAL_KNOWLEDGE_SYSTEM_PROMPT,
-                        payload=batch,
-                        stage="personal_knowledge",
-                        max_tokens=min(self.llm.max_tokens, 8192),
-                    )
+                    with self._model_boundary():
+                        raw, metadata = self.llm.complete_json(
+                            system_prompt=PERSONAL_KNOWLEDGE_SYSTEM_PROMPT,
+                            payload=batch,
+                            stage="personal_knowledge",
+                            max_tokens=min(self.llm.max_tokens, 8192),
+                        )
                     try:
                         parsed = json.loads(raw)
                     except json.JSONDecodeError as exc:
@@ -584,21 +791,47 @@ class LocalMemoryEngine:
                 agent_call={"calls": call_metadata},
             )
             generator = "local-personal-knowledge-agent"
-        self.store.save_knowledge(
-            scope_id=self.project_scope(project_id),
-            source_fingerprint=source_fingerprint,
-            payload=knowledge,
-            generator=generator,
-        )
+        with self._lock:
+            if self.store.privacy_revision() != knowledge_epoch:
+                raise SourceChanged('knowledge source changed during generation')
+            self.store.save_knowledge(
+                scope_id=self.project_scope(project_id),
+                source_fingerprint=source_fingerprint,
+                payload=knowledge,
+                generator=generator,
+            )
         return knowledge
 
     def knowledge(self, *, project_id: str) -> dict[str, Any] | None:
-        return self.store.knowledge(self.project_scope(project_id))
+        with self._lock:
+            cached = self.store.knowledge(self.project_scope(project_id))
+            if cached is None:
+                return None
+            try:
+                fingerprint = personal_knowledge_source_fingerprint(self.visual_atlas(project_id=project_id))
+            except LocalEngineError:
+                return None
+            # Older caches without origin-aware fingerprints are not silently
+            # upgraded. Reads never rebuild or invoke generation.
+            if cached.get('source_fingerprint') != fingerprint:
+                return None
+            return cached
 
     def usage(self, *, project_id: str = "", limit: int = 50) -> dict[str, Any]:
         return self.store.usage_summary(project_id=project_id, limit=limit)
 
     def delete_message(self, message_id: str) -> dict[str, Any]:
+        self.require_enrich('delete')
+        with self._workflow_lock:
+            with self._lock:
+                if self.store.message(message_id) is None:
+                    raise LocalEngineError('message does not exist')
+                self.store.mark_message_deleted(message_id)
+                self.jobs.finish(message_id, 'cancelled', 'source_deleted')
+            with self._writer_lease.acquire():
+                return self._delete_message_locked(message_id)
+
+    def _delete_message_locked(self, message_id):
         with self._lock:
             message = self.store.message(message_id)
             if message is None:
@@ -637,7 +870,18 @@ class LocalMemoryEngine:
             }
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
-        """Physically remove one project and its project/global memory records."""
+        """Revoke first; wait for in-flight inference before physical cleanup."""
+        self.require_enrich('delete')
+        with self._workflow_lock:
+            with self._lock:
+                for session in self.store.sessions(project_id):
+                    for row in self.store.messages_for_session(session['session_id']):
+                        self.store.mark_message_deleted(row['message_id'])
+                        self.jobs.finish(row['message_id'], 'cancelled', 'source_deleted')
+            with self._writer_lease.acquire():
+                return self._delete_project_locked(project_id)
+
+    def _delete_project_locked(self, project_id):
         with self._lock:
             project_id = _clean(project_id, maximum=256)
             if not project_id:
@@ -647,14 +891,14 @@ class LocalMemoryEngine:
             }
             if project_id not in projects:
                 raise LocalEngineError("project does not exist")
-            messages = self.store.messages(project_id=project_id, limit=500)
+            messages = self.store.messages(project_id=project_id, limit=500, include_deleted=True)
             if len(messages) >= 500:
                 # The API page size must never make deletion partial. Walk sessions
                 # directly because each session list is unbounded and project-owned.
                 messages = []
                 for session in self.store.sessions(project_id):
                     messages.extend(
-                        self.store.messages_for_session(str(session["session_id"]))
+                        self.store.messages_for_session(str(session["session_id"]), include_deleted=True)
                     )
             deleted_scopes = 0
             for message in messages:
@@ -689,6 +933,10 @@ class LocalMemoryEngine:
         return {
             "status": "ok",
             "mode": "local-only",
+            "runtime_mode": self.runtime_mode,
+            "capabilities": {"read": True, "enrich": self.runtime_mode == 'enrich',
+                             "async_ingest": self.runtime_mode == 'enrich',
+                             "read_consistency": "committed_snapshot"},
             "state_storage": "owner-local",
             "bind_host": self.environment["TMCRA_SERVICE_BIND_HOST"],
             "bind_port": int(self.environment["TMCRA_SERVICE_BIND_PORT"]),

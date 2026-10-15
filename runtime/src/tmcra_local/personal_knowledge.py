@@ -14,6 +14,8 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .actor_provenance import permits_human_preference
+
 
 PERSONAL_KNOWLEDGE_SCHEMA_VERSION = "tmcra.personal-knowledge.1"
 PERSONAL_KNOWLEDGE_DOMAIN_SCHEMA_VERSION = "tmcra.personal-knowledge.domain.1"
@@ -86,7 +88,12 @@ Hard rules:
     also include a faithful display object for zh and en. Preserve official
     product names, API names, code identifiers, and technical terms when
     translation would make them less precise.
-13. Return one compact JSON object and no prose.
+13. Transport actor_role user does not prove human authorship. Unknown, automated,
+    app-generated or assistant-only evidence may support attributed provisional
+    project/learned notes, never personal preferences or confirmed claims. Only
+    explicit human_authored/human_adopted declarations support those classifications;
+    declarations are not authentication or independently verified external truth.
+14. Return one compact JSON object and no prose.
 
 Return exactly:
 {
@@ -231,6 +238,10 @@ def personal_knowledge_source_fingerprint(atlas: Mapping[str, Any]) -> str:
                         "source_record_id",
                         "content_sha256",
                         "state",
+                        "actor_role",
+                        "origin_kind",
+                        "capture_method",
+                        "provenance_strength",
                     )
                 }
                 for node in nodes
@@ -384,6 +395,13 @@ def validate_personal_knowledge_batch(
     allowed_evidence = {
         _text(item.get("id"), 512) for item in _items(batch.get("evidence"))
     }
+    evidence_by_id = {_text(item.get("id"), 512): item for item in _items(batch.get("evidence"))}
+
+    def require_human_origin(ids: Sequence[str]) -> None:
+        if not ids or not all(permits_human_preference(evidence_by_id.get(item, {})) for item in ids):
+            raise PersonalKnowledgeError("personal_knowledge_origin_not_human",
+                "personal context and confirmed claims require explicit human-origin evidence; role alone is insufficient")
+
     pages = _items(result.get("pages"))
     if not 1 <= len(pages) <= PERSONAL_KNOWLEDGE_MAX_PAGES_PER_BATCH:
         raise PersonalKnowledgeError(
@@ -437,6 +455,8 @@ def validate_personal_knowledge_batch(
                     "personal_knowledge_claim_invalid",
                     "every claim must be grounded in evidence from its batch",
                 )
+            if collection == "personal" or status == "confirmed":
+                require_human_origin(evidence_ids)
             normalized_claims.append(
                 {
                     "text": text,
@@ -467,6 +487,8 @@ def validate_personal_knowledge_batch(
                     "personal_knowledge_section_invalid",
                     "every section must be grounded in evidence from its batch",
                 )
+            if collection == "personal":
+                require_human_origin(evidence_ids)
             normalized_sections.append(
                 {
                     "heading": heading,
@@ -785,6 +807,9 @@ def merge_personal_knowledge_batches(
                 "turn_index",
                 "occurred_at",
                 "actor_role",
+                "origin_kind",
+                "capture_method",
+                "provenance_strength",
                 "state",
                 "confidence",
             )

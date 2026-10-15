@@ -125,6 +125,10 @@ def probe_generation_engine(
 
     source = Path(config_path).expanduser().resolve()
     payload = load_local_runtime_config(source)
+    from .runtime_modes import runtime_mode, RuntimeModeError
+    mode = runtime_mode(payload)
+    if mode != 'enrich':
+        raise RuntimeModeError(mode, 'generation probe')
     contract = _generation_contract(payload, require_runtime=False)
     credential = _credential(payload, contract)
     if not credential:
@@ -250,12 +254,19 @@ def _generation_health(
 
 @contextmanager
 def managed_local_generation(
-    config_path: Path, *, startup_timeout_seconds: float = 300.0
+    config_path: Path, *, startup_timeout_seconds: float = 300.0, runtime_mode_override=None
 ):
     """Start and own llama-server only when the selected policy is local-model."""
 
     source = Path(config_path).expanduser().resolve()
     payload = load_local_runtime_config(source)
+    from .runtime_modes import runtime_mode, RuntimeModeError
+    mode = runtime_mode(payload, runtime_mode_override)
+    if mode == 'off':
+        raise RuntimeModeError(mode, 'service startup')
+    if mode == 'read-only':
+        yield {'source': 'disabled', 'managed': False, 'already_running': False, 'runtime_mode': mode}
+        return
     contract = _generation_contract(payload, require_runtime=False)
     if contract["source"] != "local-model":
         yield {"source": contract["source"], "managed": False, "already_running": False}

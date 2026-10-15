@@ -55,4 +55,4 @@ def local_workflows(engine):
         return digest.hexdigest()
 
     return WorkflowService(engine.state_dir / "workflows", resolve, sources, ingest, delete,
-                           revision_resolver=revision, operation_lock=engine._lock)
+                           revision_resolver=revision, operation_lock=engine._workflow_lock)

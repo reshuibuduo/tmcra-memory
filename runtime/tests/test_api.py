@@ -52,6 +52,7 @@ def test_loopback_api_auth_and_usage(config_path: Path) -> None:
                 "project_id": "api-project",
                 "session_id": "api-session",
                 "role": "user",
+                "actor": {"origin_kind": "human_authored", "capture_method": "explicit_api_declaration", "provenance_strength": "caller_declared"},
                 "content": "API 本地链路测试",
                 "source_app": "test-client",
                 "native_message_id": "api-message-1",

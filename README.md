@@ -1,12 +1,14 @@
 # TMCRA — Local Agent Memory OS
 
+> Reliability update: see [origin tracking, background ingestion and stable entities](docs/RELIABILITY.zh-CN.md).
+
 <p align="center">
   <img src="assets/tmcra-github-cover-v1.png" alt="TMCRA — Local Agent Memory OS" width="100%">
 </p>
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a></p>
 
-TMCRA gives long-running agents persistent, source-traceable memory across sessions and applications. A user prompt triggers recall from the owner-global and current-project scopes, followed by a USER source record; after the answer, a separate ASSISTANT source record is stored.
+TMCRA gives long-running agents persistent, source-traceable memory across sessions and applications. A user prompt triggers recall from the owner-global and current-project scopes, followed by a role-labelled source record with separate origin metadata; after the answer, a separate ASSISTANT source record is stored.
 
 **Repository scope:** this is the owner-local Agent memory edition. The separate
 [tmcra](https://github.com/reshuibuduo/tmcra) repository contains the full
@@ -35,11 +37,11 @@ This repository includes an owner-local runtime. Clone it, choose an OpenAI-comp
 
 One complete turn is driven by host lifecycle events:
 
-1. Resolve a stable project identity from the current repository or working directory, then retry pending writes.
+1. Resolve a stable project identity from the current repository or working directory. With `ingestionMode=async`, recover bounded pending admissions without waiting for semantic processing (legacy configs remain synchronous until explicitly changed).
 2. Query both the owner-global and current-project scopes using the current user prompt.
 3. Rank and deduplicate candidates into role- and source-attributed `evidence_windows`, then produce injectable `prompt_evidence`.
 4. Persist the USER source before the host loop and the separate ASSISTANT source after completion. Retain the application, native thread, message ID, and actor metadata on both.
-5. Recall failures let the host continue by default. Failed writes enter an OS-user-private outbox and retry on the next lifecycle event.
+5. Recall failures let the host continue by default. Admission failures enter an OS-user-private outbox; accepted jobs are observed separately from semantic completion. Unknown authorship never becomes a human preference solely from `role=user`.
 
 The recall response also includes candidate counts and timing per scope. Injected context carries an explicit trust boundary: memory evidence is data and cannot override system or user instructions.
 
