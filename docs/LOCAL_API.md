@@ -80,3 +80,21 @@ GET  /v1/usage?project_id=project-stable-id&limit=50
 ```
 
 Usage records model/provider token counters and latency only. Request and response bodies are not copied into the usage ledger. `tmcra_charge` is zero in owner-local mode; any provider charge is settled directly between the user and the selected provider.
+
+
+## Deleted-source replay protection
+
+Message and project deletion preserve only hashed stable identity fences and
+revocation timestamps, not source text or raw native IDs. Both the local message
+ID and the existing `(source_app, native_thread_id, native_message_id)` uniqueness
+key are fenced atomically with metadata deletion. A delayed hook upload that
+changes only the local ID, project, or API session is rejected rather than
+recreating the source. This is identity revocation, not content deduplication;
+a completely new identity is not blacklisted by matching text.
+
+Retained soft-deletions are backfilled on reopen. Already-erased pre-upgrade
+identities cannot be reconstructed. Tombstones intentionally survive project
+removal. Rolling back application code leaves this metadata in place, but older
+code does not enforce it; never treat a source rollback as a verified data
+migration. External backup deletion and multi-process admission remain separate
+operational concerns.

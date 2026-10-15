@@ -594,12 +594,12 @@ class LocalMemoryEngine:
         return self.store.usage_summary(project_id=project_id, limit=limit)
 
     def delete_message(self, message_id: str) -> dict[str, Any]:
-        message = self.store.message(message_id)
-        if message is None:
-            raise LocalEngineError("message does not exist")
-        scope_rows = self.store.scopes_for_message(message_id)
-        graph_results: list[dict[str, Any]] = []
         with self._lock:
+            message = self.store.message(message_id)
+            if message is None:
+                raise LocalEngineError("message does not exist")
+            scope_rows = self.store.scopes_for_message(message_id)
+            graph_results: list[dict[str, Any]] = []
             for scope in scope_rows:
                 scope_id = str(scope.get("scope_id") or "")
                 if not scope_id:
@@ -608,6 +608,7 @@ class LocalMemoryEngine:
                     scope_id
                 ).delete_message_records(message_id)
                 journal_result = self.writer_store.delete_message(scope_id, message_id)
+                self.store.invalidate_knowledge(scope_id)
                 graph_results.append(
                     {
                         "scope_id": scope_id,
@@ -619,38 +620,37 @@ class LocalMemoryEngine:
             erased = self.store.erase_message_metadata(message_id)
             self.writer_store.secure_compact()
             self.store.secure_compact()
-        return {
-            "schema_version": "tmcra.local.delete-message.1",
-            "message_id": message_id,
-            "deleted": erased,
-            "scopes": graph_results,
-            "knowledge_projection_invalidated": True,
-            "sqlite_free_pages_rewritten": True,
-            "external_backup_copies_removed": False,
-        }
+            return {
+                "schema_version": "tmcra.local.delete-message.1",
+                "message_id": message_id,
+                "deleted": erased,
+                "scopes": graph_results,
+                "knowledge_projection_invalidated": True,
+                "sqlite_free_pages_rewritten": True,
+                "external_backup_copies_removed": False,
+            }
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
         """Physically remove one project and its project/global memory records."""
-
-        project_id = _clean(project_id, maximum=256)
-        if not project_id:
-            raise LocalEngineError("project_id is required")
-        projects = {
-            str(item.get("project_id") or ""): item for item in self.store.projects()
-        }
-        if project_id not in projects:
-            raise LocalEngineError("project does not exist")
-        messages = self.store.messages(project_id=project_id, limit=500)
-        if len(messages) >= 500:
-            # The API page size must never make deletion partial. Walk sessions
-            # directly because each session list is unbounded and project-owned.
-            messages = []
-            for session in self.store.sessions(project_id):
-                messages.extend(
-                    self.store.messages_for_session(str(session["session_id"]))
-                )
-        deleted_scopes = 0
         with self._lock:
+            project_id = _clean(project_id, maximum=256)
+            if not project_id:
+                raise LocalEngineError("project_id is required")
+            projects = {
+                str(item.get("project_id") or ""): item for item in self.store.projects()
+            }
+            if project_id not in projects:
+                raise LocalEngineError("project does not exist")
+            messages = self.store.messages(project_id=project_id, limit=500)
+            if len(messages) >= 500:
+                # The API page size must never make deletion partial. Walk sessions
+                # directly because each session list is unbounded and project-owned.
+                messages = []
+                for session in self.store.sessions(project_id):
+                    messages.extend(
+                        self.store.messages_for_session(str(session["session_id"]))
+                    )
+            deleted_scopes = 0
             for message in messages:
                 message_id = str(message["message_id"])
                 for scope in self.store.scopes_for_message(message_id):
@@ -661,21 +661,22 @@ class LocalMemoryEngine:
                         message_id
                     )
                     self.writer_store.delete_message(scope_id, message_id)
+                    self.store.invalidate_knowledge(scope_id)
                     deleted_scopes += 1
             self.store.delete_project_metadata(project_id)
             self.writer_store.secure_compact()
             self.store.secure_compact()
-        return {
-            "schema_version": "tmcra.local.delete-project.1",
-            "project_id": project_id,
-            "deleted": True,
-            "deleted_messages": len(messages),
-            "deleted_scope_records": deleted_scopes,
-            "usage_metadata_removed": True,
-            "knowledge_projection_removed": True,
-            "sqlite_free_pages_rewritten": True,
-            "external_backup_copies_removed": False,
-        }
+            return {
+                "schema_version": "tmcra.local.delete-project.1",
+                "project_id": project_id,
+                "deleted": True,
+                "deleted_messages": len(messages),
+                "deleted_scope_records": deleted_scopes,
+                "usage_metadata_removed": True,
+                "knowledge_projection_removed": True,
+                "sqlite_free_pages_rewritten": True,
+                "external_backup_copies_removed": False,
+            }
 
     def health(self) -> dict[str, Any]:
         return {

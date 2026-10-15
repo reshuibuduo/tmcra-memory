@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Keep hashed source-identity tombstones in the same SQLite transaction as
+  physical message/project metadata deletion. A delayed Agent-hook replay
+  cannot recreate the deleted source by changing only its local ID or routing.
+- Backfill retained soft-deleted identities on startup; do not claim recovery
+  of identities already physically erased before this update.
+- Resolve deletion metadata under the ingest lock and invalidate knowledge
+  caches for all touched scopes, including owner-global. The runtime stays
+  owner-local; no shared tenant control plane or frozen benchmark change.
+
 - Route loopback Python generation requests, probes and the local API smoke
   client directly instead of inheriting environment or OS proxies; reject
   redirects from these endpoints. Explicit remote BYOK networking is unchanged.
