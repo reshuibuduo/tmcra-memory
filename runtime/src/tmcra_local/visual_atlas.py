@@ -12,6 +12,8 @@ import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from .actor_provenance import origin_metadata
+
 from typing import Any
 
 
@@ -712,6 +714,7 @@ def _identity_fields(node: Mapping[str, Any]) -> dict[str, Any]:
         fields.update(
             {
                 "evidence_kind": _text(node.get("evidence_kind")),
+                **origin_metadata(node),
                 "memory_id": _text(node.get("memory_id")) or None,
                 "source_record_id": _text(node.get("source_record_id")) or None,
                 "source_record_ids": sorted(_dedupe([_text(value, 512) for value in node.get("source_record_ids", [])])),
@@ -1107,6 +1110,7 @@ def build_visual_atlas(
                         "turn_index": _turn_index(node),
                         "occurred_at": _text(node.get("occurred_at")) or None,
                         "actor_role": _text(node.get("actor_role") or _attributes(node).get("actor_role"), 40) or None,
+                        **origin_metadata({**_attributes(node), **node}),
                         "confidence": _number(node.get("confidence"), 0.75),
                         "salience": _number(node.get("salience"), 0.5),
                         "state": _text(node.get("state"), 40) or "active",
@@ -1145,6 +1149,7 @@ def build_visual_atlas(
                     "turn_index": _turn_index(node),
                     "occurred_at": _text(node.get("occurred_at")) or None,
                     "actor_role": _text(node.get("actor_role") or _attributes(node).get("actor_role"), 40) or None,
+                        **origin_metadata({**_attributes(node), **node}),
                     "confidence": _number(node.get("confidence"), 1.0),
                     "salience": _number(node.get("salience"), 0.35),
                     "state": _text(node.get("state"), 40) or "committed",
@@ -1206,6 +1211,7 @@ def build_visual_atlas(
                         "turn_index": source["turn_index"],
                         "occurred_at": source["occurred_at"],
                         "actor_role": "assistant",
+                        **origin_metadata(source),
                         "confidence": min(0.85, source["confidence"]),
                         "salience": max(0.55, source["salience"]),
                         "state": "active",
@@ -1213,6 +1219,17 @@ def build_visual_atlas(
                         "content_sha256": source["content_sha256"],
                     }
                     episode_records[episode_id]["memory_ids"].append(memory_id)
+
+    for memory in memory_records.values():
+        references = list(memory["source_record_ids"])
+        originals = [origin_metadata(source_records.get(identifier, {})) for identifier in references]
+        if not originals:
+            originals = [origin_metadata({})]
+        for field in ("origin_kind", "capture_method", "provenance_strength"):
+            values = {item[field] for item in originals}
+            memory[field] = next(iter(values)) if len(values) == 1 else ("legacy_role_only" if field == "capture_method" else "unknown")
+        if memory["origin_kind"] == "unknown":
+            memory["provenance_strength"] = "unknown"
 
     for memory_id in sorted(memory_records):
         entry = memory_records[memory_id]
@@ -1235,6 +1252,7 @@ def build_visual_atlas(
                 turn_index=entry["turn_index"],
                 occurred_at=entry["occurred_at"],
                 actor_role=entry["actor_role"],
+                **origin_metadata(entry),
                 confidence=entry["confidence"],
                 salience=entry["salience"],
                 state=entry["state"],
@@ -1263,6 +1281,7 @@ def build_visual_atlas(
                 turn_index=entry["turn_index"],
                 occurred_at=entry["occurred_at"],
                 actor_role=entry["actor_role"],
+                **origin_metadata(entry),
                 confidence=entry["confidence"],
                 salience=entry["salience"],
                 state=entry["state"],
@@ -1617,6 +1636,9 @@ def build_visual_atlas_episode_batches(
                                     "memory_type",
                                     "layer",
                                     "actor_role",
+                                    "origin_kind",
+                                    "capture_method",
+                                    "provenance_strength",
                                     "occurred_at",
                                     "tags",
                                     "display",

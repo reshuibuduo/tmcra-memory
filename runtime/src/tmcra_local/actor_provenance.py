@@ -19,7 +19,12 @@ AGENT_FIELDS = (
     "agent_specialty",
     "agent_team",
 )
-ACTOR_FIELDS = ("actor_role", *AGENT_FIELDS)
+ORIGIN_FIELDS = ("origin_kind", "capture_method", "provenance_strength")
+ORIGIN_KINDS = frozenset({"human_authored", "human_adopted", "app_generated", "automation",
+                          "assistant_generated", "tool_generated", "unknown"})
+CAPTURE_METHODS = frozenset({"host_event_metadata", "explicit_api_declaration", "legacy_role_only"})
+PROVENANCE_STRENGTHS = frozenset({"host_declared", "caller_declared", "unknown"})
+ACTOR_FIELDS = ("actor_role", *AGENT_FIELDS, *ORIGIN_FIELDS)
 ROUTING_FIELDS = ("target_agent_id",)
 AGENT_FIELD_LIMITS = {
     "agent_id": 200,
@@ -94,12 +99,11 @@ def normalize_message_actor_metadata(
     role: Any,
     metadata: Any,
 ) -> dict[str, str]:
-    """Return the bounded producer identity persisted for one message.
+    """Validate bounded identity declarations, not human authorship/authentication.
 
-    Arbitrary integration metadata may still travel with an API request, but it
-    is never copied into the memory graph.  Only this allowlisted, size-bounded
-    identity becomes immutable provenance.  The message role is authoritative:
-    a caller cannot label assistant output as a user statement (or vice versa).
+    Role is a transport label. Origin is separate, and host_declared is still a
+    declaration, never a credential. Missing origin stays unknown when read;
+    old immutable JSON/hash bytes are preserved rather than migrated silently.
     """
 
     actor_role = str(role or "").strip().lower()
@@ -142,7 +146,56 @@ def normalize_message_actor_metadata(
         raise ActorProvenanceError(
             "user messages cannot declare an assistant agent producer"
         )
+    if any(field in metadata for field in ORIGIN_FIELDS):
+        kind = _text(metadata.get("origin_kind"), field="origin_kind", limit=40) or "unknown"
+        method = _text(metadata.get("capture_method"), field="capture_method", limit=40) or "explicit_api_declaration"
+        strength = _text(metadata.get("provenance_strength"), field="provenance_strength", limit=40) or "caller_declared"
+        if kind not in ORIGIN_KINDS or method not in CAPTURE_METHODS or strength not in PROVENANCE_STRENGTHS:
+            raise ActorProvenanceError("message origin declaration is invalid")
+        if kind in {"human_authored", "human_adopted"} and actor_role != "user":
+            raise ActorProvenanceError("human origin requires user transport role")
+        if kind == "unknown":
+            strength = "unknown"
+        result.update(origin_kind=kind, capture_method=method, provenance_strength=strength)
     return result
+
+
+def origin_metadata(value: Mapping[str, Any]) -> dict[str, str]:
+    """Conservative read view; does not rewrite immutable legacy identities."""
+    kind = str(value.get("origin_kind") or "unknown")
+    method = str(value.get("capture_method") or "legacy_role_only")
+    strength = str(value.get("provenance_strength") or "unknown")
+    if kind not in ORIGIN_KINDS:
+        kind = "unknown"
+    if method not in CAPTURE_METHODS:
+        method = "legacy_role_only"
+    if strength not in PROVENANCE_STRENGTHS or kind == "unknown":
+        strength = "unknown"
+    return dict(origin_kind=kind, capture_method=method, provenance_strength=strength)
+
+
+def permits_human_preference(value: Mapping[str, Any]) -> bool:
+    origin = origin_metadata(value)
+    role = str(value.get("actor_role") or value.get("message_role") or value.get("role") or "")
+    return (role == "user" and origin["origin_kind"] in {"human_authored", "human_adopted"}
+            and origin["provenance_strength"] != "unknown")
+
+
+def source_authority(value: Mapping[str, Any], *, derived: bool = False) -> str:
+    """Human-looking text, legacy roles and prior authority labels never upgrade origin."""
+    origin = origin_metadata(value)["origin_kind"]
+    role = str(value.get("actor_role") or value.get("message_role") or value.get("role") or "")
+    if permits_human_preference(value):
+        return "derived_user_memory" if derived else "user_source"
+    if origin in {"app_generated", "automation", "assistant_generated", "tool_generated"}:
+        stem = origin
+    elif role == "assistant":
+        stem = "assistant"
+    elif role == "tool":
+        stem = "tool"
+    else:
+        stem = "unknown_origin"
+    return f"derived_{stem}_memory" if derived else f"{stem}_source"
 
 
 def actor_metadata_json(value: Mapping[str, Any]) -> str:
@@ -199,7 +252,7 @@ def _actor_identity(metadata: Mapping[str, Any]) -> dict[str, str]:
     ).strip().lower()
     if role not in ACTOR_ROLES:
         return {}
-    result = {"actor_role": role}
+    result = {"actor_role": role, **origin_metadata(metadata)}
     for field in AGENT_FIELDS:
         value = metadata.get(field)
         if isinstance(value, str) and value.strip():
@@ -265,6 +318,14 @@ def _merge_identities(identities: Sequence[Mapping[str, str]]) -> dict[str, Any]
             result[field] = values[0]
         elif values:
             result[AGENT_PLURAL_FIELDS[field]] = values
+    # Mixed or missing source origin must not become a human declaration.
+    origins = [origin_metadata(identity) for identity in identities]
+    for field in ORIGIN_FIELDS:
+        values = {origin[field] for origin in origins}
+        fallback = "legacy_role_only" if field == "capture_method" else "unknown"
+        result[field] = next(iter(values)) if len(values) == 1 else fallback
+    if result.get("origin_kind") == "unknown":
+        result["provenance_strength"] = "unknown"
     targets: list[str] = []
     for identity in identities:
         value = str(identity.get("target_agent_id") or "").strip()
@@ -294,7 +355,8 @@ def enrich_evidence_actor_provenance(
     def visit(value: Any) -> Any:
         if isinstance(value, Mapping):
             row = {str(key): visit(item) for key, item in value.items()}
-            identities = [index[item] for item in _source_ids(row) if item in index]
+            source_ids = _source_ids(row)
+            identities = [index.get(item, {"origin_kind": "unknown"}) for item in source_ids]
             if not identities:
                 for field in ("source_parent", "source_parents"):
                     nested = row.get(field)
@@ -312,8 +374,11 @@ def enrich_evidence_actor_provenance(
             resolved = _merge_identities(identities)
             for field, item in resolved.items():
                 existing = row.get(field)
-                if existing in (None, "", []):
+                if field in ORIGIN_FIELDS or existing in (None, "", []):
                     row[field] = item
+            if identities and (row.get("authority") or row.get("actor_role")):
+                derived = str(row.get("authority") or "").startswith("derived_") or bool(row.get("claim_text"))
+                row["authority"] = source_authority(row, derived=derived)
             return row
         if isinstance(value, Sequence) and not isinstance(
             value, (str, bytes, bytearray)

@@ -21,6 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from .entity_identity import (IDENTITY_FIELDS, normalize_identity_metadata, bind_assertion_identity,
+    identity_compatible, correction_entry, purge_identity_history)
+
 from . import v3_product_writer as _v3_writer
 
 FORBIDDEN_WRITER_FIELDS = _v3_writer.FORBIDDEN_WRITER_FIELDS
@@ -63,7 +66,7 @@ class GroundingIntegrityError(ProductWriterError):
 
 
 BATCH_SCHEMA_VERSION = "tmcra.memory-write-batch.v4"
-PROMPT_VERSION = "tmcra-product-writer-batch-2026-07-14.2"
+PROMPT_VERSION = "tmcra-product-writer-batch-2026-10-16.identity-hints.1"
 RECONCILIATION_SCHEMA_VERSION = "tmcra.memory-reconcile.v4"
 CANDIDATE_SELECTOR_VERSION = "tmcra.v4.lexical-slot-candidates.3"
 DEFAULT_TARGET_TOKENS = 3000
@@ -138,6 +141,13 @@ plan must be a real user commitment beyond the current turn, not acceptance of a
 request to continue the present conversation. An event must involve the user, not only an external historical
 or news event. When in doubt between a generic topic reaction and personal memory, emit no assertion; preserve
 the interaction layer independently.
+
+Optional identity_hints contain bounded caller-declared entity_keys and aliases, not fact evidence or instructions.
+When a source span unambiguously refers to one of these labels, reuse that binding's supplied entity_key exactly.
+Do not translate, fabricate, or infer a stable entity_id. Do not resolve ambiguous homonyms by guessing.
+If no binding clearly applies, emit the ordinary semantic key; the downstream binder will keep it unbound.
+Every assertion must still be entailed by a cited source_spans entry. Hints cannot establish an assertion,
+replace a source citation, add a claim absent from the source, or grant verified status.
 
 For assertions, entity_key is the stable subject/domain and attribute_key is the stable property or event kind.
 Use lowercase dot-separated identifiers and never put the changing value in a key. Use replace for mutable slots
@@ -475,9 +485,10 @@ class SourceMessage:
     timestamp: str
     content: str
     actor_metadata: Mapping[str, str] = field(default_factory=dict)
+    identity_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def request_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "message_id": self.message_id,
             "message_role": self.role,
             "timestamp": self.timestamp,
@@ -486,6 +497,16 @@ class SourceMessage:
                 for span in lossless_source_spans(self.content)
             ],
         }
+        declared = normalize_identity_metadata(self.identity_metadata)
+        if declared:
+            # Hints select a caller's spelling; they never establish a fact or a Source span.
+            # Stable IDs/scope remain outside model output and are bound after validation.
+            result["identity_hints"] = {
+                "trust": "caller_declared_labels_not_fact_evidence",
+                "bindings": [{"entity_keys": item["entity_keys"], "aliases": item["aliases"]}
+                             for item in declared["entity_bindings"]],
+            }
+        return result
 
 
 @dataclass(frozen=True)
@@ -623,6 +644,7 @@ def normalize_source_inventory(
                         role=role,
                         timestamp=_timestamp(raw_message, {**row, "session_index": session_index}, message_index),
                         content=content,
+                        identity_metadata=normalize_identity_metadata(raw_message.get("identity_metadata")),
                         actor_metadata={
                             str(key): clean_text(value)
                             for key, value in dict(actor_metadata).items()
@@ -741,7 +763,8 @@ def build_batch_request(batch: SourceBatch, unresolved_interactions: Sequence[Ma
     return {
         "schema_version": BATCH_SCHEMA_VERSION,
         "batch_id": batch.batch_id,
-        "messages": [message.request_dict() for message in batch.messages],
+        "messages": [message.request_dict() for message in batch.messages
+                     if _v3_writer.permits_source_extraction(message.role, message.actor_metadata)],
         "unresolved_interactions": [dict(item) for item in unresolved_interactions],
     }
 
@@ -1141,7 +1164,8 @@ def validate_batch_response(
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
         raise ProductWriterError("root.messages must be an array")
-    expected_messages = [message for message in batch.messages if message.role in {"user", "assistant"}]
+    expected_messages = [message for message in batch.messages
+                         if _v3_writer.permits_source_extraction(message.role, message.actor_metadata)]
     if len(raw_messages) != len(expected_messages):
         raise ProductWriterError("batch response must contain exactly one entry for every user or assistant message")
     existing_ids = {
@@ -2553,6 +2577,31 @@ class V4BatchStore:
 
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            source_row = connection.execute(
+                "SELECT source_record_id FROM v4_source_journal WHERE scope_id=? AND message_id=?",
+                (scope_id, message_id),
+            ).fetchone()
+            removed_sources = {str(source_row["source_record_id"])} if source_row and source_row["source_record_id"] else set()
+
+            def cites_removed_source(value: Any) -> bool:
+                if isinstance(value, Mapping):
+                    return any(cites_removed_source(item) for item in value.values())
+                if isinstance(value, list):
+                    return any(cites_removed_source(item) for item in value)
+                return isinstance(value, str) and value in removed_sources
+
+            # Reconciliation/commit snapshots can embed an older Source's value
+            # and aliases. Remove those audits rather than rewriting frozen hashes.
+            # Existing graph facts and their own immutable Sources remain intact.
+            for table, primary_key, json_column in (
+                ("v4_reconciliation_jobs", "job_id", "request_json"),
+                ("v4_message_commit_journal", "commit_id", "plan_json"),
+            ):
+                for candidate in connection.execute(
+                    f"SELECT {primary_key},{json_column} FROM {table} WHERE scope_id=?", (scope_id,)
+                ).fetchall():
+                    if cites_removed_source(json.loads(candidate[json_column] or "{}")):
+                        connection.execute(f"DELETE FROM {table} WHERE {primary_key}=?", (candidate[primary_key],))
             committed_rows = connection.execute(
                 "SELECT DISTINCT batch_id FROM v4_message_commit_journal "
                 "WHERE scope_id=? AND message_id=?",
@@ -3520,6 +3569,8 @@ class RealGraphBackend:
                     raise ProductWriterError(
                         f"{message.message_id}: real source graph location changed"
                     )
+                if normalize_identity_metadata(metadata.get("identity_metadata")) != normalize_identity_metadata(message.identity_metadata):
+                    raise ProductWriterError(f"{message.message_id}: immutable source identity metadata changed")
                 return str(record.memory_id), int(record.turn_index)
             turn_index = self.adapter.graph.next_turn()
             records, _ = build_graph_records(
@@ -3545,6 +3596,7 @@ class RealGraphBackend:
                     "prompt_version": PROMPT_VERSION,
                     "enrichment_status": "pending",
                     "source_record_id": source.memory_id,
+                    "identity_metadata": normalize_identity_metadata(message.identity_metadata),
                 }
             )
             stored = self.adapter.graph.add_records([source])
@@ -3604,6 +3656,9 @@ class RealGraphBackend:
             "agent_specialty",
             "agent_team",
             "target_agent_id",
+            "origin_kind",
+            "capture_method",
+            "provenance_strength",
         ):
             if clean_text(metadata.get(key)) != clean_text(
                 message.actor_metadata.get(key)
@@ -3611,6 +3666,8 @@ class RealGraphBackend:
                 raise ProductWriterError(
                     f"{message.message_id}: committed real source {key} changed"
                 )
+        if normalize_identity_metadata(metadata.get("identity_metadata")) != normalize_identity_metadata(message.identity_metadata):
+            raise ProductWriterError(f"{message.message_id}: committed real source identity metadata changed")
         if self._verified_source_content(record) != message.content:
             raise ProductWriterError(
                 f"{message.message_id}: committed real source content changed"
@@ -3700,6 +3757,9 @@ class RealGraphBackend:
             }
             for memory_id in deleted_ids:
                 graph.records_by_id.pop(memory_id, None)
+            for record in graph.records_by_id.values():
+                record.metadata = purge_identity_history(record.metadata, source_ids)
+                record.supersedes = [mid for mid in getattr(record, "supersedes", []) if mid not in deleted_ids]
             deleted_edges = 0
             for edge_id, edge in list(graph.memory_edges.items()):
                 if (
@@ -3848,6 +3908,8 @@ class RealGraphBackend:
         self, assertion: Mapping[str, Any], *, limit: int = 3
     ) -> list[dict[str, Any]]:
         self._reload()
+        if assertion.get("identity_status") in {"ambiguous", "unbound"}:
+            return []
         proposed_slot = _graph_slot_key(assertion.get("canonical_key"))
         proposed_canonical = (
             _slot_tokens(proposed_slot) - _BROAD_SLOT_IDENTITY_TOKENS
@@ -3887,6 +3949,24 @@ class RealGraphBackend:
                 or not slot
                 or slot == proposed_slot
             ):
+                continue
+            if not identity_compatible(assertion, metadata, str(getattr(self, "scope_id", ""))):
+                continue
+            # Explicit ID/attribute matches survive extraction-key and language drift.
+            # They are candidates, never an automatic replace/merge decision.
+            if (assertion.get("entity_id") and assertion.get("entity_id") == metadata.get("entity_id")
+                and clean_text(assertion.get("attribute_key")) == clean_text(metadata.get("attribute_key"))
+                and proposed_family == clean_text(metadata.get("memory_family") or metadata.get("memory_type"))):
+                item = {"memory_id": str(record.memory_id), "value": str(record.value),
+                    "claim_text": str(record.value), "evidence_quote": clean_text(metadata.get("evidence_quote")) or str(record.value),
+                    "canonical_slot_key": slot, "durability": metadata.get("durability"),
+                    "record_state": str(record.state), "turn_index": int(record.turn_index),
+                    "metadata": metadata, "candidate_score": 2_000_000.0,
+                    "candidate_reason": "explicit_same_scope_entity_attribute"}
+                existing = by_slot.get(slot)
+                ranked = (2_000_000.0, int(record.turn_index), record, item)
+                if existing is None or ranked[:2] > existing[:2]:
+                    by_slot[slot] = ranked
                 continue
             if _normalized_claim(str(record.value)) == _normalized_claim(
                 str(assertion.get("claim_text"))
@@ -4569,6 +4649,14 @@ class RealGraphBackend:
                     raise ProductWriterError(
                         f"{incoming.memory_id}: replacement target state is unsupported: {old.state!r}"
                     )
+                event = correction_entry(previous=old, incoming=persisted_incoming,
+                    scope_id=self.scope_id, observed_at=message.timestamp)
+                history = list(incoming_metadata.get("correction_history") or [])
+                if not any(item.get("transition_id") == event["transition_id"] for item in history):
+                    history.append(event)
+                incoming_metadata["correction_history"] = history
+                old_metadata["superseded_effective_at"] = event["effective_at"]
+                old_metadata["superseded_recorded_at"] = event["recorded_at"]
                 old.state = "superseded"
                 old_metadata["superseded_by"] = incoming.memory_id
                 old_metadata["superseded_reason"] = (
@@ -4779,6 +4867,9 @@ def build_graph_records(record_class: Any, **kwargs: Any) -> tuple[list[Any], di
         metadata["claim_text"] = claim_text
         metadata["evidence_quote"] = evidence_quote
         metadata["semantic_value_kind"] = "atomic_claim"
+        for key in IDENTITY_FIELDS:
+            if key in assertion:
+                metadata[key] = assertion[key]
         record.metadata = metadata
     return records, counts
 
@@ -4786,6 +4877,8 @@ def build_graph_records(record_class: Any, **kwargs: Any) -> tuple[list[Any], di
 def _binding_identity(value: Mapping[str, Any]) -> dict[str, str]:
     metadata = dict(value.get("metadata") or {})
     return {
+        **{key: _json(value.get(key, metadata.get(key))) for key in IDENTITY_FIELDS
+           if key in value or key in metadata},
         "memory_id": clean_text(value.get("memory_id")),
         "claim_text": _normalized_claim(
             clean_text(value.get("claim_text") or value.get("value"))
@@ -5542,6 +5635,7 @@ class V4BatchWriter:
             "temporal_status": assertion["temporal_status"],
             "polarity": assertion["polarity"],
             "durability": durability,
+            **{key: assertion[key] for key in IDENTITY_FIELDS if key in assertion},
         }
         current_cited = []
         for leaf in current:
@@ -5568,6 +5662,7 @@ class V4BatchWriter:
                     "attribute_key": clean_text(metadata.get("attribute_key")),
                     "memory_type": clean_text(metadata.get("memory_type")),
                     "memory_family": clean_text(metadata.get("memory_family")),
+                    **{key: metadata[key] for key in IDENTITY_FIELDS if key in metadata},
                 }
             )
         request = {
@@ -6048,7 +6143,9 @@ class V4BatchWriter:
                 plan=json.loads(plan_json),
                 response_message=response_message,
             )
-        assertions = [dict(item) for item in v3.get("assertions") or []]
+        assertions = [bind_assertion_identity(item, source.identity_metadata,
+            scope_id=batch.scope_id, source_message_id=source.message_id)
+            for item in v3.get("assertions") or []]
         decisions: dict[int, str] = {}
         current_by_index: dict[int, Sequence[Mapping[str, Any]]] = {}
         duplicate_provenance: list[dict[str, Any]] = []
@@ -6078,7 +6175,8 @@ class V4BatchWriter:
             )
 
         for assertion_index, assertion in enumerate(assertions):
-            exact_current = backend.current_leaves(str(assertion["canonical_key"]))
+            exact_current = [leaf for leaf in backend.current_leaves(str(assertion["canonical_key"]))
+                if identity_compatible(assertion, dict(leaf.get("metadata") or {}), batch.scope_id)]
             new_claim = _normalized_claim(str(assertion["claim_text"]))
             persisted_job_id = _reconciliation_job_id(
                 batch, source, assertion_index, assertion
@@ -6479,7 +6577,7 @@ class V4BatchWriter:
             if row["status"] == "validated":
                 validated = json.loads(row["response_json"])
                 self.stats["resumed_batches"] += 1
-            elif not any(message.role in {"user", "assistant"} for message in batch.messages):
+            elif not any(_v3_writer.permits_source_extraction(message.role, message.actor_metadata) for message in batch.messages):
                 # Immutable-only batches are journaled and committed without a semantic API call.
                 validated = {"schema_version": BATCH_SCHEMA_VERSION, "batch_id": batch.batch_id, "messages": []}
                 self.store.persist_response(batch.batch_id, validated, {"api_call_count": 0, "reason": "immutable_only_batch"})
@@ -6535,6 +6633,9 @@ class V4BatchWriter:
                 with mutation_batch() if callable(mutation_batch) else nullcontext():
                     for response_message in validated["messages"]:
                         source_index = source_indexes[response_message["message_id"]]
+                        source = batch.messages[source_index]
+                        if not _v3_writer.permits_source_extraction(source.role, source.actor_metadata):
+                            raise ProductWriterError("persisted response requires explicit origin review before semantic replay")
                         committed_count = self._commit_message(
                             batch, source_index, response_message
                         )
@@ -6577,6 +6678,12 @@ class V4BatchWriter:
                                 "writer_called": True,
                             }
                         )
+                source_only = tuple(message for message in batch.messages
+                    if not _v3_writer.permits_source_extraction(message.role, message.actor_metadata))
+                if source_only:
+                    source_batch = SourceBatch(batch.scope_id, batch.session_id, batch.session_index, batch.batch_index, source_only)
+                    self.store.mark_source_enriched(source_batch)
+                    self._set_graph_source_status(source_batch, "enriched")
                 for product_write_row in product_write_rows:
                     self._append_unique_jsonl(
                         "product_write_messages.jsonl",

@@ -19,6 +19,23 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 
+def permits_source_extraction(role: str, actor_metadata: Mapping[str, Any]) -> bool:
+    """Role is transport; unknown/automatic user-origin stays immutable-only."""
+    if role == "assistant":
+        return True  # Existing validator drops assistant assertions.
+    return (role == "user"
+            and actor_metadata.get("origin_kind") in {"human_authored", "human_adopted"}
+            and actor_metadata.get("provenance_strength") in {"host_declared", "caller_declared"})
+
+
+def origin_authority(role: str, actor_metadata: Mapping[str, Any], *, derived: bool = False) -> str:
+    if role == "user" and permits_source_extraction(role, actor_metadata):
+        return "user_assertion" if derived else "user_source"
+    kind = actor_metadata.get("origin_kind", "unknown")
+    stem = kind if kind in {"app_generated", "automation", "assistant_generated", "tool_generated"} else ("assistant" if role == "assistant" else "unknown_origin")
+    return f"derived_{stem}_memory" if derived else f"{stem}_source"
+
+
 WRITE_SCHEMA_VERSION = "tmcra.memory-write.v3.4"
 PROMPT_VERSION = "tmcra-product-writer-2026-07-10.21"
 SOURCE_JOURNAL_CLAIM_LEASE_SECONDS = 900
@@ -1317,6 +1334,9 @@ def build_graph_records(
     allowed_actor_fields = {
         "actor_provenance_schema",
         "actor_role",
+        "origin_kind",
+        "capture_method",
+        "provenance_strength",
         "agent_id",
         "agent_name",
         "agent_role",
@@ -1345,6 +1365,7 @@ def build_graph_records(
     source_slot = f"source.s{session_index:03d}.m{message_index:03d}"
     source_metadata = {
         "source": "tmcra_v3_product_runtime",
+        "authority": origin_authority(role, actor_provenance),
         "writer_schema_version": WRITE_SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
         "content_variant": "source_message",
@@ -1391,7 +1412,11 @@ def build_graph_records(
         )
     ]
     counts = {"source": 1, "semantic": 0, "facet": 0, "interaction": 0}
+    if not permits_source_extraction(role, actor_provenance):
+        return records, counts
     assertions = list((extraction or {}).get("assertions") or [])
+    if not permits_source_extraction(role, actor_provenance) or role != "user":
+        assertions = []
     for memory_index_in_message, memory in enumerate(assertions):
         canonical_key = str(memory["canonical_key"])
         entity_key = str(memory["entity_key"])
@@ -1422,7 +1447,7 @@ def build_graph_records(
             "memory_layer": "fast",
             "node_kind": "atomic_user_assertion",
             "atomic_evidence_leaf": True,
-            "authority": "user_assertion",
+            "authority": origin_authority(role, actor_provenance, derived=True),
             "raw_content": evidence_quote,
             "source_span": evidence_quote,
             "evidence_char_start": int(memory.get("evidence_char_start", 0) or 0),

@@ -28,7 +28,9 @@ def _ingest(
         source_app=app,
         native_thread_id=session,
         native_message_id=native_id,
-        actor={"actor_role": role, "actor_id": "owner" if role == "user" else "agent"},
+        actor={"actor_role": role, "actor_id": "owner" if role == "user" else "agent",
+               "origin_kind": "human_authored" if role == "user" else "assistant_generated",
+               "capture_method": "explicit_api_declaration", "provenance_strength": "caller_declared"},
         visibility=visibility,
     )
 

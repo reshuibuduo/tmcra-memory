@@ -122,7 +122,10 @@ def build_local_config(
     generation_profile_id: str = "recommended-qwen36",
     local_generation_base_url: str = "http://127.0.0.1:2010/v1",
     generation_runtime_executable: str = "",
+    runtime_mode: str = "enrich",
 ) -> dict[str, Any]:
+    if runtime_mode not in {"off", "read-only", "enrich"}:
+        raise LocalConfigError("runtime_mode must be off, read-only, or enrich")
     profile = resolve_embedding_profile(embedding_profile_id)
     reranker_profile = resolve_reranker_profile(reranker_profile_id)
     generation_profile = resolve_generation_profile(generation_profile_id)
@@ -286,6 +289,7 @@ def build_local_config(
     return {
         "schema_version": LOCAL_CONFIG_SCHEMA_VERSION,
         "mode": "local-first",
+        "runtime_mode": runtime_mode,
         "network": {
             "bind_host": "127.0.0.1",
             "bind_port": 2009,
